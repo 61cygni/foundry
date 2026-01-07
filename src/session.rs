@@ -4,12 +4,13 @@ use axum::{body::Bytes, extract::ws::{Message, Utf8Bytes, WebSocket}};
 use futures_util::{stream::SplitStream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use xcap::Frame;
 
 use crate::{
     AppState,
     audio_mixer::{MixerInput, MixedChunk},
+    audio_capture::AudioChunk,
     video_pipeline::{VideoCodec, VideoPipeline},
 };
 
@@ -163,6 +164,20 @@ fn build_audio_chunk(chunk: &MixedChunk) -> Bytes {
     Bytes::from(out)
 }
 
+fn build_direct_audio_chunk(chunk: &AudioChunk) -> Bytes {
+    let sample_count = chunk.samples.len() as u32;
+    let mut out = Vec::with_capacity(24 + chunk.samples.len() * 2);
+    out.extend_from_slice(b"AUD0");
+    out.extend_from_slice(&0.0f64.to_le_bytes()); // start_ms not used for direct
+    out.extend_from_slice(&chunk.sample_rate.to_le_bytes());
+    out.extend_from_slice(&chunk.channels.to_le_bytes());
+    out.extend_from_slice(&sample_count.to_le_bytes());
+    for s in &chunk.samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    Bytes::from(out)
+}
+
 pub async fn start(
     mut receiver: SplitStream<WebSocket>,
     tx: mpsc::Sender<Message>,
@@ -234,10 +249,14 @@ async fn run_video(
     let mut pending_config_sent = false;
     let mut force_idr_next = false;
     let mut downsampler = Downsampler::new();
-    let mut audio_rx = state.mixer.subscribe();
+    
+    // Use direct audio capture if available, otherwise fall back to mixer
+    let mut direct_audio_rx = state.audio_broadcast.as_ref().map(|c| c.subscribe());
+    let mut mixer_audio_rx = if direct_audio_rx.is_none() { Some(state.mixer.subscribe()) } else { None };
     let audio_tx = state.mixer.input_sender();
 
-    println!("video pipeline started");
+    println!("video pipeline started (audio: {})", 
+        if direct_audio_rx.is_some() { "direct capture" } else { "mixer" });
 
     loop {
         tokio::select! {
@@ -281,17 +300,26 @@ async fn run_video(
                     None => break,
                 }
             }
-            mixed = audio_rx.recv() => {
-                match mixed {
-                    Ok(chunk) => {
-                        if tx.send(Message::Binary(build_audio_chunk(&chunk))).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("audio broadcast lagged by {n} messages");
-                    }
+            // Direct audio capture (low latency, stereo)
+            Some(Ok(chunk)) = async { 
+                match &mut direct_audio_rx {
+                    Some(rx) => Some(rx.recv().await),
+                    None => None,
+                }
+            } => {
+                if tx.send(Message::Binary(build_direct_audio_chunk(&chunk))).await.is_err() {
+                    break;
+                }
+            }
+            // Mixer audio (fallback, higher latency)
+            Some(Ok(chunk)) = async {
+                match &mut mixer_audio_rx {
+                    Some(rx) => Some(rx.recv().await),
+                    None => None,
+                }
+            } => {
+                if tx.send(Message::Binary(build_audio_chunk(&chunk))).await.is_err() {
+                    break;
                 }
             }
             frame = listen_frames.recv() => {

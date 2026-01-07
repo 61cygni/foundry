@@ -1,89 +1,106 @@
-use std::time::Instant;
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
-use crate::audio_mixer::MixerInput;
+/// Raw audio chunk for direct streaming (bypasses mixer for low latency)
+#[derive(Debug, Clone)]
+pub struct AudioChunk {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub samples: Vec<i16>,
+}
 
+/// Handle to subscribe to audio - this is Send+Sync safe
+#[derive(Clone)]
+pub struct AudioBroadcast {
+    sender: broadcast::Sender<AudioChunk>,
+}
+
+impl AudioBroadcast {
+    pub fn subscribe(&self) -> broadcast::Receiver<AudioChunk> {
+        self.sender.subscribe()
+    }
+}
+
+/// Audio capture (not Send/Sync - keep on main thread)
 pub struct AudioCapture {
     _stream: cpal::Stream,
 }
 
-impl AudioCapture {
-    /// Create audio capture from the default input device.
-    /// For system audio on macOS, use BlackHole as input device.
-    pub fn new(audio_tx: mpsc::Sender<MixerInput>) -> anyhow::Result<Self> {
-        let host = cpal::default_host();
-        
-        // Try to find BlackHole device first for system audio capture
-        let device = host
-            .input_devices()?
-            .find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase().contains("blackhole"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| {
-                println!("[Audio] BlackHole not found, using default input device");
-                println!("[Audio] For system audio capture, install: brew install blackhole-2ch");
-                host.default_input_device()
-            })
-            .ok_or_else(|| anyhow::anyhow!("No audio input device found"))?;
+/// Start audio capture and return a broadcast handle that can be shared across threads.
+/// The AudioCapture must be kept alive (not dropped) for capture to continue.
+pub fn start_audio_capture() -> anyhow::Result<(AudioCapture, AudioBroadcast)> {
+    let host = cpal::default_host();
+    
+    // Try to find BlackHole device first for system audio capture
+    let device = host
+        .input_devices()?
+        .find(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().contains("blackhole"))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            println!("[Audio] BlackHole not found, using default input device");
+            println!("[Audio] For system audio capture, install: brew install blackhole-2ch");
+            host.default_input_device()
+        })
+        .ok_or_else(|| anyhow::anyhow!("No audio input device found"))?;
 
-        let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-        println!("[Audio] Using input device: {}", device_name);
+    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    println!("[Audio] Using input device: {}", device_name);
 
-        let config = device.default_input_config()?;
-        println!("[Audio] Sample rate: {}, Channels: {}", 
-            config.sample_rate().0, config.channels());
+    let config = device.default_input_config()?;
+    println!("[Audio] Sample rate: {}, Channels: {}", 
+        config.sample_rate().0, config.channels());
 
-        let sample_rate = config.sample_rate().0;
-        let channels = config.channels() as u32;
-        let start_time = Instant::now();
+    let sample_rate = config.sample_rate().0;
+    let channels = config.channels() as u32;
+    
+    // Broadcast channel for sending to all connected clients
+    let (sender, _) = broadcast::channel::<AudioChunk>(64);
+    let sender_clone = sender.clone();
 
-        // Build the appropriate stream based on sample format
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => build_stream::<f32>(
-                &device, 
-                &config.into(), 
-                audio_tx, 
-                sample_rate, 
-                channels,
-                start_time,
-            )?,
-            cpal::SampleFormat::I16 => build_stream::<i16>(
-                &device, 
-                &config.into(), 
-                audio_tx, 
-                sample_rate, 
-                channels,
-                start_time,
-            )?,
-            cpal::SampleFormat::U16 => build_stream::<u16>(
-                &device, 
-                &config.into(), 
-                audio_tx, 
-                sample_rate, 
-                channels,
-                start_time,
-            )?,
-            _ => return Err(anyhow::anyhow!("Unsupported sample format")),
-        };
+    // Build the appropriate stream based on sample format
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => build_stream::<f32>(
+            &device, 
+            &config.into(), 
+            sender_clone, 
+            sample_rate, 
+            channels,
+        )?,
+        cpal::SampleFormat::I16 => build_stream::<i16>(
+            &device, 
+            &config.into(), 
+            sender_clone, 
+            sample_rate, 
+            channels,
+        )?,
+        cpal::SampleFormat::U16 => build_stream::<u16>(
+            &device, 
+            &config.into(), 
+            sender_clone, 
+            sample_rate, 
+            channels,
+        )?,
+        _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+    };
 
-        stream.play()?;
-        println!("[Audio] Capture started");
+    stream.play()?;
+    println!("[Audio] Capture started (low-latency direct mode)");
 
-        Ok(Self { _stream: stream })
-    }
+    let capture = AudioCapture { _stream: stream };
+    let broadcast = AudioBroadcast { sender };
+    
+    Ok((capture, broadcast))
 }
 
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    audio_tx: mpsc::Sender<MixerInput>,
+    sender: broadcast::Sender<AudioChunk>,
     sample_rate: u32,
     channels: u32,
-    start_time: Instant,
 ) -> anyhow::Result<cpal::Stream>
 where
     T: cpal::Sample<Float = f32> + cpal::SizedSample + Send + 'static,
@@ -93,36 +110,23 @@ where
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            let start_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-            
-            // Convert to mono i16 samples
-            let samples: Vec<i16> = if channels == 1 {
-                data.iter()
-                    .map(|s| sample_to_i16(*s))
-                    .collect()
-            } else {
-                // Mix down to mono by averaging channels
-                data.chunks(channels as usize)
-                    .map(|chunk| {
-                        let sum: i32 = chunk.iter().map(|s| sample_to_i16(*s) as i32).sum();
-                        (sum / channels as i32) as i16
-                    })
-                    .collect()
-            };
+            // Keep stereo, convert to i16
+            let samples: Vec<i16> = data.iter()
+                .map(|s| sample_to_i16(*s))
+                .collect();
 
             if samples.is_empty() {
                 return;
             }
 
-            let input = MixerInput {
-                start_ms,
+            let chunk = AudioChunk {
                 sample_rate,
-                channels: 1, // We mix to mono
+                channels,
                 samples,
             };
 
-            // Non-blocking send - drop if buffer full
-            let _ = audio_tx.try_send(input);
+            // Non-blocking send - if no receivers or buffer full, drop
+            let _ = sender.send(chunk);
         },
         err_fn,
         None,

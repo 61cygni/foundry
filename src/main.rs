@@ -28,6 +28,7 @@ mod audio_capture;
 struct AppState {
     recorder: Arc<recording::Recorder>,
     mixer: Arc<audio_mixer::AudioMixer>,
+    audio_broadcast: Option<audio_capture::AudioBroadcast>,
 }
 
 #[tokio::main]
@@ -36,22 +37,23 @@ async fn main() {
     let mixer = audio_mixer::AudioMixer::new();
     
     // Start system audio capture (requires BlackHole for system audio)
-    let audio_tx = mixer.input_sender();
-    let _audio_capture = match audio_capture::AudioCapture::new(audio_tx) {
-        Ok(capture) => {
+    // We must keep _audio_capture alive - dropping it stops the capture
+    let (_audio_capture, audio_broadcast) = match audio_capture::start_audio_capture() {
+        Ok((capture, broadcast)) => {
             println!("System audio capture enabled");
-            Some(capture)
+            (Some(capture), Some(broadcast))
         }
         Err(err) => {
             eprintln!("Audio capture not available: {}", err);
             eprintln!("For system audio, install BlackHole: brew install blackhole-2ch");
-            None
+            (None, None)
         }
     };
     
     let state = AppState {
         recorder: Arc::new(recorder),
         mixer: Arc::new(mixer),
+        audio_broadcast,
     };
 
     let serve_files = [
