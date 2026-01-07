@@ -96,9 +96,12 @@ impl EncoderImpl {
 
         if self.width != even_w || self.height != even_h {
             // Recreate encoder with correct dimensions.
-            let bitrate = (even_w * even_h * 3).clamp(200_000, 8_000_000);
+            // Use higher bitrate for better quality (aim for ~15Mbps for 1080p)
+            let bitrate = (even_w * even_h * 8).clamp(500_000, 15_000_000);
             let cfg = openh264::encoder::EncoderConfig::new(even_w, even_h)
-                .set_bitrate_bps(bitrate);
+                .set_bitrate_bps(bitrate)
+                .max_frame_rate(60.0)  // Target 60 FPS
+                .rate_control_mode(openh264::encoder::RateControlMode::Bitrate);
             self.encoder = openh264::encoder::Encoder::with_config(cfg)?;
             self.width = even_w;
             self.height = even_h;
