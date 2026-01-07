@@ -13,7 +13,8 @@ use crate::{
     video_pipeline::{VideoCodec, VideoPipeline},
 };
 
-const MAX_PIXELS: usize = 3_840 * 2_160;
+// Keep resolution manageable for software encoding (~1080p equivalent)
+const MAX_PIXELS: usize = 1_920 * 1_080;
 
 #[derive(Debug, Deserialize)]
 struct ModeRequest {

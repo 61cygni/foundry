@@ -114,17 +114,20 @@ fn create_frame_receiver_thread(
                 let mut listeners = listeners.lock().unwrap();
                 if !listeners.is_empty() {
                     // println!("sending frame to {} listeners", listeners.len());
+                    static DROPPED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    
                     listeners.retain(|listener| match listener.try_send(frame.clone()) {
                         Ok(_) => {
-                            // println!("sent frame to listener");
+                            // Reset drop counter on successful send
+                            DROPPED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
                             true
                         },
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
-                            eprintln!("listener full: frame: {} x {} ({} bytes)",
-                                frame.width,
-                                frame.height,
-                                frame.raw.len()
-                            );
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_frame)) => {
+                            // Only log occasionally to avoid spam
+                            let count = DROPPED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if count % 60 == 0 {
+                                eprintln!("encoder can't keep up, dropped {} frames", count + 1);
+                            }
                             true
                         },
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(frame)) => {
