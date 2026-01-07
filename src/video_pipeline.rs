@@ -144,6 +144,11 @@ impl EncoderImpl {
             }
         }
 
+        // Skip frames with no NAL units (encoder skipped output)
+        if nals.is_empty() {
+            return Ok(None);
+        }
+
         let avcc = nals_to_avcc(&nals);
         Ok(Some(EncodedChunk { data: avcc }))
     }
