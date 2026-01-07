@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <title>Foundry</title>
+        <style>
+            html, body {
+                margin: 0;
+                padding: 0;
+                height: 100%;
+                background: #555;
+                touch-action: none;
+            }
+            #screen {
+                width: 100vw;
+                height: 100vh;
+                display: block;
+                background: #111;
+            }
+            #overlay {
+                position: fixed;
+                top: 12px;
+                left: 50%;
+                transform: translateX(-50%);
+                min-width: 260px;
+                max-width: min(360px, calc(100vw - 24px));
+                background: rgba(15, 15, 20, 0.5);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 12px;
+                font-family: system-ui, -apple-system, sans-serif;
+                box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+                backdrop-filter: blur(14px);
+                color: #f5f5f5;
+                overflow: hidden;
+                transition: max-width 0.2s ease;
+            }
+            #overlay.collapsed {
+                background: rgba(15, 15, 20, 0.45);
+                max-width: 220px;
+            }
+            .overlay-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                padding: 10px 12px;
+            }
+            #overlay-toggle {
+                border: none;
+                background: rgba(99, 102, 241, 0.15);
+                color: #c7d2fe;
+                padding: 6px 10px;
+                font-size: 12px;
+                border-radius: 999px;
+                cursor: pointer;
+                transition: background 0.2s ease, color 0.2s ease;
+            }
+            #overlay-toggle:hover {
+                background: rgba(99, 102, 241, 0.3);
+                color: white;
+            }
+            #overlay-body {
+                border-top: 1px solid rgba(255, 255, 255, 0.08);
+                padding: 12px 16px 16px 16px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                transition: max-height 0.25s ease, opacity 0.2s ease, padding 0.25s ease;
+                max-height: 1000px;
+                opacity: 1;
+            }
+            #overlay.collapsed #overlay-body {
+                max-height: 0;
+                opacity: 0;
+                padding-top: 0;
+                padding-bottom: 0;
+                pointer-events: none;
+            }
+            .connection-meta {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                font-size: 12px;
+                opacity: 0.85;
+            }
+            .connection-badge {
+                font-size: 11px;
+                letter-spacing: 0.15em;
+                text-transform: uppercase;
+                color: #a5b4fc;
+            }
+            #endpoint {
+                font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+                font-size: 12px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                opacity: 0.85;
+            }
+            #log {
+                max-height: 140px;
+                overflow-y: auto;
+                margin: 0;
+                padding-left: 20px;
+                font-size: 12px;
+                color: rgba(255, 255, 255, 0.85);
+                scroll-behavior: smooth;
+            }
+            #uv-container {
+                width: 100%;
+                height: 10px;
+                background: rgba(255, 255, 255, 0.1);
+                border-radius: 5px;
+                overflow: hidden;
+            }
+            #uv-meter {
+                height: 100%;
+                width: 0%;
+                background: linear-gradient(90deg, #0ea5e9, #6366f1, #c084fc);
+            }
+            #audio-controls {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                font-size: 12px;
+            }
+            #audio-toggle {
+                border: none;
+                border-radius: 8px;
+                padding: 10px 14px;
+                font-size: 13px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: transform 0.15s ease, box-shadow 0.15s ease;
+                background: rgba(255, 255, 255, 0.12);
+                color: #f5f5f5;
+            }
+            #audio-toggle:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
+            }
+            #mic-icon-toggle {
+                border: none;
+                background: rgba(255, 255, 255, 0.08);
+                color: inherit;
+                width: 36px;
+                height: 36px;
+                border-radius: 50%;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                cursor: pointer;
+                transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+            }
+            #mic-icon-toggle .mic-dot {
+                position: relative;
+                width: 16px;
+                height: 16px;
+                border-radius: 50%;
+                background: rgba(255, 255, 255, 0.1);
+                border: 1px solid rgba(255, 255, 255, 0.25);
+                overflow: hidden;
+            }
+            #mic-icon-toggle .mic-level {
+                position: absolute;
+                left: 0;
+                bottom: 0;
+                width: 100%;
+                height: 100%;
+                background: linear-gradient(180deg, #22c55e, #f97316, #ef4444);
+                transform: scaleY(0);
+                transform-origin: bottom;
+                transition: transform 0.08s linear;
+            }
+            #mic-icon-toggle.active {
+                background: rgba(239, 68, 68, 0.2);
+                box-shadow: 0 0 12px rgba(239, 68, 68, 0.4);
+            }
+            #overlay.collapsed #mic-icon-toggle {
+                display: inline-flex;
+            }
+            .meter {
+                flex: 1;
+                min-width: 80px;
+                height: 12px;
+                border-radius: 999px;
+                background: rgba(255, 255, 255, 0.12);
+                overflow: hidden;
+                position: relative;
+            }
+            .meter-bar {
+                position: absolute;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                width: 0%;
+                transition: width 0.08s linear;
+            }
+            #mic-meter {
+                background: linear-gradient(90deg, #22c55e, #facc15, #f97316, #ef4444);
+            }
+            .sr-only {
+                position: absolute;
+                width: 1px;
+                height: 1px;
+                padding: 0;
+                margin: -1px;
+                overflow: hidden;
+                clip: rect(0, 0, 0, 0);
+                border: 0;
+            }
+            #stats {
+                position: fixed;
+                right: 8px;
+                bottom: 8px;
+                padding: 8px 10px;
+                background: rgba(0, 0, 0, 0.7);
+                color: #f5f5f5;
+                font-family: system-ui, -apple-system, sans-serif;
+                font-size: 12px;
+                border-radius: 6px;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+                min-width: 160px;
+                text-align: right;
+            }
+        </style>
+    </head>
+    <body>
+        <script type="importmap">
+        {
+            "imports": {
+            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+            "three/addons/": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/examples/jsm/",
+            "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.20.0/+esm",
+            "@sparkjsdev/spark": "/dist/spark.module.js"
+            }
+        }
+        </script>
+        <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+        <!-- <script type="importmap">
+        {
+            "imports": {
+            "three": "/examples/js/vendor/three/build/three.module.js",
+            "three/addons/": "/examples/js/vendor/three/examples/jsm/",
+            "lil-gui": "/examples/js/vendor/lil-gui/dist/lil-gui.esm.js",        "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.20.0/+esm",
+            "@sparkjsdev/spark": "/dist/spark.module.js"
+            }
+        }
+        </script>
+        <script src="/examples/js/vendor/stats.js/build/stats.min.js"></script> -->        
+        <canvas id="canvas"></canvas>
+        <div id="overlay" class="overlay-expanded">
+            <div class="overlay-header">
+                <button id="overlay-toggle" aria-expanded="true">Hide panel</button>
+                <button id="mic-icon-toggle" aria-pressed="false" aria-label="Start mic">
+                    <span class="mic-dot">
+                        <span class="mic-level" id="mic-icon-level"></span>
+                    </span>
+                </button>
+            </div>
+            <div id="overlay-body">
+                <div class="connection-meta">
+                        <span class="connection-badge">Foundry</span>
+                    <code id="endpoint"></code>
+                </div>
+                <div id="audio-controls">
+                    <button id="audio-toggle">Start mic</button>
+                    <div class="meter">
+                        <div class="meter-bar" id="mic-meter"></div>
+                    </div>
+                    <span id="audio-status" class="sr-only">idle</span>
+                </div>
+                <div id="uv-container">
+                    <div id="uv-meter"></div>
+                </div>
+                <ul id="log"></ul>
+            </div>
+        </div>
+        <div id="stats">
+            <div id="stats-bw"></div>
+            <div id="stats-fps"></div>
+        </div>
+        <script type="module" src="/root.js"></script>
+    </body>
+</html>
