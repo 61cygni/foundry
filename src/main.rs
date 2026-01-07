@@ -22,6 +22,7 @@ mod session;
 mod recording;
 mod video_pipeline;
 mod audio_mixer;
+mod audio_capture;
 
 #[derive(Clone)]
 struct AppState {
@@ -33,6 +34,21 @@ struct AppState {
 async fn main() {
     let recorder = recording::Recorder::new();
     let mixer = audio_mixer::AudioMixer::new();
+    
+    // Start system audio capture (requires BlackHole for system audio)
+    let audio_tx = mixer.input_sender();
+    let _audio_capture = match audio_capture::AudioCapture::new(audio_tx) {
+        Ok(capture) => {
+            println!("System audio capture enabled");
+            Some(capture)
+        }
+        Err(err) => {
+            eprintln!("Audio capture not available: {}", err);
+            eprintln!("For system audio, install BlackHole: brew install blackhole-2ch");
+            None
+        }
+    };
+    
     let state = AppState {
         recorder: Arc::new(recorder),
         mixer: Arc::new(mixer),
