@@ -1,8 +1,10 @@
-//! AAC audio decoder using symphonia
+//! Audio decoder with symphonia + ffmpeg fallback
 
 use anyhow::{anyhow, Result};
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::formats::FormatOptions;
@@ -18,7 +20,31 @@ pub struct DecodedAudio {
 }
 
 /// Decode all audio from an MP4 file
+/// Tries symphonia first, falls back to ffmpeg if that fails
 pub fn decode_audio(path: &Path) -> Result<Option<DecodedAudio>> {
+    // Try symphonia first (fast, no external dependencies)
+    match decode_audio_symphonia(path) {
+        Ok(Some(audio)) => return Ok(Some(audio)),
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            eprintln!("Symphonia decode failed: {}", e);
+            eprintln!("Trying ffmpeg fallback...");
+        }
+    }
+
+    // Fall back to ffmpeg
+    match decode_audio_ffmpeg(path) {
+        Ok(Some(audio)) => {
+            println!("Audio decoded via ffmpeg");
+            Ok(Some(audio))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => Err(anyhow!("Both decoders failed. ffmpeg error: {}", e)),
+    }
+}
+
+/// Decode audio using symphonia (built-in, supports AAC-LC)
+fn decode_audio_symphonia(path: &Path) -> Result<Option<DecodedAudio>> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -76,7 +102,6 @@ pub fn decode_audio(path: &Path) -> Result<Option<DecodedAudio>> {
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                // Convert to i16 samples
                 let samples = convert_to_i16(&decoded, channels);
                 all_samples.extend(samples);
             }
@@ -97,6 +122,83 @@ pub fn decode_audio(path: &Path) -> Result<Option<DecodedAudio>> {
     }))
 }
 
+/// Decode audio using ffmpeg (external, supports all formats)
+fn decode_audio_ffmpeg(path: &Path) -> Result<Option<DecodedAudio>> {
+    // Check if ffmpeg is available
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        return Err(anyhow!("ffmpeg not found. Install with: brew install ffmpeg"));
+    }
+
+    let path_str = path.to_string_lossy();
+
+    // First, probe the file to get audio info
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v", "quiet",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate,channels",
+            "-of", "csv=p=0",
+            &path_str,
+        ])
+        .output()?;
+
+    if !probe.status.success() {
+        return Err(anyhow!("ffprobe failed"));
+    }
+
+    let probe_output = String::from_utf8_lossy(&probe.stdout);
+    let parts: Vec<&str> = probe_output.trim().split(',').collect();
+    
+    if parts.len() < 2 {
+        return Ok(None); // No audio stream
+    }
+
+    let sample_rate: u32 = parts[0].parse().unwrap_or(48000);
+    let channels: u32 = parts[1].parse().unwrap_or(2);
+
+    // Decode audio to raw PCM (signed 16-bit little-endian)
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-i", &path_str,
+            "-vn",                      // No video
+            "-acodec", "pcm_s16le",     // Output format: signed 16-bit LE
+            "-ar", &sample_rate.to_string(),
+            "-ac", &channels.to_string(),
+            "-f", "s16le",              // Raw PCM output
+            "-",                        // Output to stdout
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("No stdout"))?;
+    
+    // Read all PCM data
+    let mut pcm_data = Vec::new();
+    stdout.read_to_end(&mut pcm_data)?;
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow!("ffmpeg decoding failed"));
+    }
+
+    if pcm_data.is_empty() {
+        return Ok(None);
+    }
+
+    // Convert bytes to i16 samples (little-endian)
+    let samples: Vec<i16> = pcm_data
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+
+    Ok(Some(DecodedAudio {
+        samples,
+        sample_rate,
+        channels,
+    }))
+}
+
 /// Convert audio buffer to interleaved i16 samples
 fn convert_to_i16(buffer: &AudioBufferRef, target_channels: u32) -> Vec<i16> {
     match buffer {
@@ -110,10 +212,8 @@ fn convert_to_i16(buffer: &AudioBufferRef, target_channels: u32) -> Vec<i16> {
                     let sample = if ch < channels {
                         buf.chan(ch)[frame]
                     } else {
-                        // Duplicate last channel if fewer channels than target
                         buf.chan(channels - 1)[frame]
                     };
-                    // Convert f32 [-1.0, 1.0] to i16
                     let clamped = sample.clamp(-1.0, 1.0);
                     samples.push((clamped * 32767.0) as i16);
                 }
@@ -149,7 +249,6 @@ fn convert_to_i16(buffer: &AudioBufferRef, target_channels: u32) -> Vec<i16> {
                     } else {
                         buf.chan(channels - 1)[frame]
                     };
-                    // Convert i32 to i16 (shift down)
                     samples.push((sample >> 16) as i16);
                 }
             }
