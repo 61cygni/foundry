@@ -123,6 +123,7 @@ fn decode_audio_symphonia(path: &Path) -> Result<Option<DecodedAudio>> {
 }
 
 /// Decode audio using ffmpeg (external, supports all formats)
+/// Always outputs 48kHz stereo for consistency
 fn decode_audio_ffmpeg(path: &Path) -> Result<Option<DecodedAudio>> {
     // Check if ffmpeg is available
     if Command::new("ffmpeg").arg("-version").output().is_err() {
@@ -130,31 +131,10 @@ fn decode_audio_ffmpeg(path: &Path) -> Result<Option<DecodedAudio>> {
     }
 
     let path_str = path.to_string_lossy();
-
-    // First, probe the file to get audio info
-    let probe = Command::new("ffprobe")
-        .args([
-            "-v", "quiet",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=sample_rate,channels",
-            "-of", "csv=p=0",
-            &path_str,
-        ])
-        .output()?;
-
-    if !probe.status.success() {
-        return Err(anyhow!("ffprobe failed"));
-    }
-
-    let probe_output = String::from_utf8_lossy(&probe.stdout);
-    let parts: Vec<&str> = probe_output.trim().split(',').collect();
     
-    if parts.len() < 2 {
-        return Ok(None); // No audio stream
-    }
-
-    let sample_rate: u32 = parts[0].parse().unwrap_or(48000);
-    let channels: u32 = parts[1].parse().unwrap_or(2);
+    // Always output 48kHz stereo - simpler and more reliable than probing
+    let sample_rate: u32 = 48000;
+    let channels: u32 = 2;
 
     // Decode audio to raw PCM (signed 16-bit little-endian)
     let mut child = Command::new("ffmpeg")
@@ -162,8 +142,8 @@ fn decode_audio_ffmpeg(path: &Path) -> Result<Option<DecodedAudio>> {
             "-i", &path_str,
             "-vn",                      // No video
             "-acodec", "pcm_s16le",     // Output format: signed 16-bit LE
-            "-ar", &sample_rate.to_string(),
-            "-ac", &channels.to_string(),
+            "-ar", "48000",             // Always 48kHz
+            "-ac", "2",                 // Always stereo
             "-f", "s16le",              // Raw PCM output
             "-",                        // Output to stdout
         ])
