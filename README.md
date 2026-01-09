@@ -173,26 +173,3 @@ cargo build --release
 # Run with logging
 RUST_LOG=debug ./target/release/foundry
 ```
-
----
-
-## Integration with Protoverse
-
-Both `foundry` and `foundry-player` work with Protoverse VR. Add to your `world.json`:
-
-```json
-{
-  "foundryDisplays": [
-    {
-      "name": "Cinema",
-      "wsUrl": "ws://localhost:23646/ws",
-      "position": [0, 2, -3],
-      "rotation": [0, 0, 0, 1],
-      "width": 3.5,
-      "aspectRatio": 1.777
-    }
-  ]
-}
-```
-
-The protocol is identical - switch between screen sharing and movie playback by running different servers on the same port.
