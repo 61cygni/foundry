@@ -1,0 +1,30 @@
+[package]
+name = "foundry-player"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Martin Casado"]
+description = "Stream MP4 files over WebSocket with H.264 passthrough"
+
+[[bin]]
+name = "foundry-player"
+path = "src/main.rs"
+
+[dependencies]
+# Web server
+axum = { version = "0.8", features = ["macros", "ws"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# MP4 parsing
+mp4 = "0.14"
+
+# Audio decoding (AAC to PCM)
+symphonia = { version = "0.5", features = ["aac", "isomp4"] }
+
+# Utilities
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

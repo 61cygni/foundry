@@ -8,6 +8,7 @@ use axum::{
     routing::get,
     Router,
 };
+use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -24,6 +25,15 @@ mod video_pipeline;
 mod audio_mixer;
 mod audio_capture;
 
+#[derive(Parser)]
+#[command(name = "foundry")]
+#[command(about = "A fast screen streaming server using H.264 over WebSocket")]
+struct Cli {
+    /// Stream a specific window by ID (use window-pick to get the ID)
+    #[arg(long)]
+    window: Option<u32>,
+}
+
 #[derive(Clone)]
 struct AppState {
     recorder: Arc<recording::Recorder>,
@@ -33,7 +43,14 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let recorder = recording::Recorder::new();
+    let cli = Cli::parse();
+
+    let capture_source = match cli.window {
+        Some(window_id) => recording::CaptureSource::Window(window_id),
+        None => recording::CaptureSource::PrimaryMonitor,
+    };
+
+    let recorder = recording::Recorder::new(capture_source);
     let mixer = audio_mixer::AudioMixer::new();
     
     // Start system audio capture (requires BlackHole for system audio)

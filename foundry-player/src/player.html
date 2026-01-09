@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Foundry Player</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #111;
+            overflow: hidden;
+        }
+        #screen {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+            object-fit: contain;
+            background: #000;
+        }
+        #overlay {
+            position: fixed;
+            top: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(15, 15, 20, 0.7);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            font-family: system-ui, -apple-system, sans-serif;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(12px);
+            color: #f5f5f5;
+            padding: 8px 16px;
+            font-size: 13px;
+            transition: opacity 0.3s ease;
+        }
+        #play-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            z-index: 100;
+        }
+        #play-button {
+            width: 100px;
+            height: 100px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.2s, background 0.2s;
+        }
+        #play-button:hover {
+            transform: scale(1.1);
+            background: rgba(255, 255, 255, 0.25);
+        }
+        #play-button::after {
+            content: "";
+            width: 0;
+            height: 0;
+            border-style: solid;
+            border-width: 20px 0 20px 35px;
+            border-color: transparent transparent transparent white;
+            margin-left: 8px;
+        }
+        #play-overlay.hidden {
+            display: none;
+        }
+        #stats {
+            position: fixed;
+            right: 8px;
+            bottom: 8px;
+            padding: 6px 10px;
+            background: rgba(0, 0, 0, 0.6);
+            color: #aaa;
+            font-family: system-ui, -apple-system, sans-serif;
+            font-size: 11px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div id="play-overlay">
+        <div id="play-button"></div>
+    </div>
+    <canvas id="screen"></canvas>
+    <div id="overlay">
+        <span id="status">Click to play</span>
+    </div>
+    <div id="stats">
+        <div id="stats-bw"></div>
+        <div id="stats-fps"></div>
+    </div>
+
+    <script type="module">
+        import { createVideoController } from "./video.js";
+        import { createStatsTracker } from "./stats.js";
+
+        const canvas = document.getElementById("screen");
+        const statusEl = document.getElementById("status");
+        const statsBw = document.getElementById("stats-bw");
+        const statsFps = document.getElementById("stats-fps");
+        const playOverlay = document.getElementById("play-overlay");
+
+        const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+        const endpoint = `${wsScheme}://${location.host}/ws`;
+
+        const stats = createStatsTracker({
+            windowMs: 1000,
+            statsBwEl: statsBw,
+            statsFpsEl: statsFps,
+        });
+
+        const videoController = createVideoController({
+            canvas,
+            log: console.log,
+            requestKeyframe: () => {},
+            onFrame: stats.recordFrameSample,
+        });
+
+        // Stereo audio player with sequential scheduling + drift correction
+        const AUDIO_MAGIC = [0x41, 0x55, 0x44, 0x30]; // "AUD0"
+        let audioCtx = null;
+        let nextPlayTime = 0;
+
+        function isAudioBuffer(data) {
+            if (!(data instanceof ArrayBuffer) || data.byteLength < 4) return false;
+            const view = new Uint8Array(data);
+            return AUDIO_MAGIC.every((code, i) => view[i] === code);
+        }
+
+        function playAudioChunk(buffer) {
+            // Parse audio chunk
+            const view = new DataView(buffer);
+            const sampleRate = view.getUint32(12, true);
+            const channels = view.getUint32(16, true);
+            const sampleCount = view.getUint32(20, true);
+            const samples = new Int16Array(buffer, 24, sampleCount);
+
+            // Create audio context on first chunk (should already exist from click)
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                nextPlayTime = audioCtx.currentTime + 0.05; // Initial 50ms buffer
+            }
+
+            // Convert to float and create audio buffer
+            const frameCount = Math.floor(sampleCount / channels);
+            const audioBuffer = audioCtx.createBuffer(channels, frameCount, sampleRate);
+            
+            for (let ch = 0; ch < channels; ch++) {
+                const channelData = audioBuffer.getChannelData(ch);
+                for (let i = 0; i < frameCount; i++) {
+                    channelData[i] = samples[i * channels + ch] / 32768;
+                }
+            }
+
+            const now = audioCtx.currentTime;
+            const duration = frameCount / sampleRate;
+
+            // Drift correction: reset if schedule is too far behind or ahead
+            // This keeps latency bounded while preventing gaps/overlaps
+            if (nextPlayTime < now || nextPlayTime > now + 0.12) {
+                nextPlayTime = now + 0.03; // Reset to 30ms ahead
+            }
+
+            // Schedule this chunk to play after the previous one
+            const src = audioCtx.createBufferSource();
+            src.buffer = audioBuffer;
+            src.connect(audioCtx.destination);
+            src.start(nextPlayTime);
+            nextPlayTime += duration;
+        }
+
+        let ws = null;
+
+        function connect() {
+            ws = new WebSocket(endpoint);
+            ws.binaryType = "arraybuffer";
+
+            ws.onopen = () => {
+                console.log("Connected");
+                statusEl.textContent = "Playing";
+                stats.reset();
+            };
+
+            ws.onclose = () => {
+                console.log("Disconnected");
+                statusEl.textContent = "Disconnected";
+                stats.showDisconnected();
+                // Show play overlay again for reconnect
+                playOverlay.classList.remove("hidden");
+            };
+
+            ws.onerror = (err) => {
+                console.error("WebSocket error:", err);
+            };
+
+            ws.onmessage = (ev) => {
+                if (typeof ev.data === "string") {
+                    if (ev.data === "heartbeat") return;
+                    try {
+                        const msg = JSON.parse(ev.data);
+                        if (msg.type === "video-config") {
+                            videoController?.configureDecoder(msg.config);
+                        } else if (msg.type === "mode-ack") {
+                            console.log("Mode:", msg.mode);
+                        }
+                    } catch (_) {
+                        console.log("Received:", ev.data);
+                    }
+                    return;
+                }
+                
+                // Check if this is audio data
+                if (isAudioBuffer(ev.data)) {
+                    playAudioChunk(ev.data);
+                    return;
+                }
+                
+                // Video frame
+                stats.recordChunkSample(ev.data?.byteLength ?? 0);
+                videoController?.enqueueChunk(ev.data);
+            };
+        }
+
+        // Wait for user click before starting (ensures audio works)
+        playOverlay.addEventListener("click", () => {
+            // Create audio context immediately on user gesture
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            nextPlayTime = audioCtx.currentTime + 0.05; // Initial buffer
+            
+            // Hide overlay
+            playOverlay.classList.add("hidden");
+            statusEl.textContent = "Connecting...";
+            
+            // Now connect
+            connect();
+        });
+
+        // Resize canvas to window
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener("resize", resize);
+        resize();
+    </script>
+</body>
+</html>

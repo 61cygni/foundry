@@ -60,11 +60,39 @@ impl Downsampler {
         }
 
         if scale <= 1 {
-            return DownsampledFrame { frame, scale: 1 };
+            // Even without downscaling, ensure even dimensions for H.264
+            let even_w = src_w & !1;
+            let even_h = src_h & !1;
+            if even_w == src_w && even_h == src_h {
+                return DownsampledFrame { frame, scale: 1 };
+            }
+            // Need to crop to even dimensions
+            let needed = even_w * even_h * 4;
+            if self.buffer.len() < needed {
+                self.buffer.resize(needed, 0);
+            }
+            let src = &frame.raw;
+            let dst = &mut self.buffer[..needed];
+            for y in 0..even_h {
+                let src_start = y * src_w * 4;
+                let dst_start = y * even_w * 4;
+                dst[dst_start..dst_start + even_w * 4]
+                    .copy_from_slice(&src[src_start..src_start + even_w * 4]);
+            }
+            let cropped = Frame {
+                width: even_w as u32,
+                height: even_h as u32,
+                raw: dst[..needed].to_vec(),
+            };
+            return DownsampledFrame {
+                frame: Arc::new(cropped),
+                scale: 1,
+            };
         }
 
-        let dst_w = src_w / scale;
-        let dst_h = src_h / scale;
+        // Ensure even output dimensions for H.264 compatibility
+        let dst_w = (src_w / scale) & !1;
+        let dst_h = (src_h / scale) & !1;
         if dst_w == 0 || dst_h == 0 {
             return DownsampledFrame { frame, scale: 1 };
         }
