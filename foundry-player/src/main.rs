@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::{
     fs,
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::{interval, MissedTickBehavior},
 };
 
@@ -176,6 +176,9 @@ async fn get_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl Int
 async fn handle_ws(stream: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = stream.split();
     let (tx, mut rx) = mpsc::channel::<Message>(OUTBOUND_BUFFER);
+    
+    // Pause state: false = playing, true = paused
+    let (pause_tx, pause_rx) = watch::channel(false);
 
     // Outbound task: send messages to client
     let outbound = tokio::spawn(async move {
@@ -201,7 +204,7 @@ async fn handle_ws(stream: WebSocket, state: AppState) {
     // Playback task
     let tx_clone = tx.clone();
     let playback = tokio::spawn(async move {
-        if let Err(e) = run_playback(tx_clone, state).await {
+        if let Err(e) = run_playback(tx_clone, state, pause_rx).await {
             eprintln!("Playback error: {}", e);
         }
     });
@@ -211,8 +214,20 @@ async fn handle_ws(stream: WebSocket, state: AppState) {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
-                    // Handle commands like seek, pause, etc. (future)
-                    println!("Received: {}", text);
+                    // Parse JSON commands
+                    if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
+                        match cmd.get("type").and_then(|t| t.as_str()) {
+                            Some("pause") => {
+                                println!("Paused");
+                                let _ = pause_tx.send(true);
+                            }
+                            Some("resume") => {
+                                println!("Resumed");
+                                let _ = pause_tx.send(false);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 Message::Close(_) => break,
                 _ => {}
@@ -224,7 +239,11 @@ async fn handle_ws(stream: WebSocket, state: AppState) {
     println!("Session ended");
 }
 
-async fn run_playback(tx: mpsc::Sender<Message>, state: AppState) -> Result<()> {
+async fn run_playback(
+    tx: mpsc::Sender<Message>,
+    state: AppState,
+    mut pause_rx: watch::Receiver<bool>,
+) -> Result<()> {
     let start_time = state.start_time;
     println!("Starting playback at {:.1}s...", start_time);
 
@@ -259,6 +278,7 @@ async fn run_playback(tx: mpsc::Sender<Message>, state: AppState) -> Result<()> 
 
     loop {
         let playback_start = Instant::now();
+        let mut pause_offset = Duration::ZERO; // Total time spent paused
         let mut last_audio_time: f64 = start_time;
         let mut found_keyframe = false;
         
@@ -266,6 +286,17 @@ async fn run_playback(tx: mpsc::Sender<Message>, state: AppState) -> Result<()> 
         let frames = state.demuxer.frames()?;
 
         for frame in frames {
+            // Check if paused - wait until resumed
+            while *pause_rx.borrow() {
+                let pause_start = Instant::now();
+                // Wait for state change
+                if pause_rx.changed().await.is_err() {
+                    return Ok(()); // Channel closed
+                }
+                // Accumulate pause duration
+                pause_offset += pause_start.elapsed();
+            }
+            
             let frame = frame?;
             
             // Skip frames before start time
@@ -283,9 +314,10 @@ async fn run_playback(tx: mpsc::Sender<Message>, state: AppState) -> Result<()> 
             }
 
             // Calculate when this frame should be presented (relative to start_time)
+            // Account for time spent paused
             let relative_time = frame.timestamp_secs - start_time;
             let target_time = Duration::from_secs_f64(relative_time);
-            let elapsed = playback_start.elapsed();
+            let elapsed = playback_start.elapsed() - pause_offset;
 
             // Wait until it's time to send this frame
             if target_time > elapsed {

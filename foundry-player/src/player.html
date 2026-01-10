@@ -83,6 +83,62 @@
             font-size: 11px;
             border-radius: 4px;
         }
+        #pause-btn {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 60px;
+            height: 60px;
+            background: rgba(255, 255, 255, 0.15);
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.3s, transform 0.2s, background 0.2s;
+            opacity: 0;
+            z-index: 50;
+        }
+        #pause-btn:hover {
+            background: rgba(255, 255, 255, 0.25);
+            transform: translateX(-50%) scale(1.1);
+        }
+        body:hover #pause-btn.visible {
+            opacity: 1;
+        }
+        #pause-btn.visible {
+            opacity: 0.3;
+        }
+        #pause-btn .icon {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        /* Pause icon (two bars) */
+        #pause-btn.playing .icon::before,
+        #pause-btn.playing .icon::after {
+            content: "";
+            width: 6px;
+            height: 22px;
+            background: white;
+            margin: 0 3px;
+            border-radius: 2px;
+        }
+        /* Play icon (triangle) */
+        #pause-btn.paused .icon::before {
+            content: "";
+            width: 0;
+            height: 0;
+            border-style: solid;
+            border-width: 12px 0 12px 20px;
+            border-color: transparent transparent transparent white;
+            margin-left: 4px;
+        }
+        #pause-btn.paused .icon::after {
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -97,6 +153,7 @@
         <div id="stats-bw"></div>
         <div id="stats-fps"></div>
     </div>
+    <button id="pause-btn" class="playing"><div class="icon"></div></button>
 
     <script type="module">
         import { createVideoController } from "./video.js";
@@ -107,6 +164,9 @@
         const statsBw = document.getElementById("stats-bw");
         const statsFps = document.getElementById("stats-fps");
         const playOverlay = document.getElementById("play-overlay");
+        const pauseBtn = document.getElementById("pause-btn");
+
+        let isPaused = false;
 
         const wsScheme = location.protocol === "https:" ? "wss" : "ws";
         const endpoint = `${wsScheme}://${location.host}/ws`;
@@ -229,14 +289,61 @@
             };
         }
 
+        function togglePause() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            
+            isPaused = !isPaused;
+            
+            if (isPaused) {
+                pauseBtn.classList.remove("playing");
+                pauseBtn.classList.add("paused");
+                statusEl.textContent = "Paused";
+                // Suspend audio
+                if (audioCtx && audioCtx.state === "running") {
+                    audioCtx.suspend();
+                }
+                // Tell server to pause
+                ws.send(JSON.stringify({ type: "pause" }));
+            } else {
+                pauseBtn.classList.remove("paused");
+                pauseBtn.classList.add("playing");
+                statusEl.textContent = "Playing";
+                // Resume audio
+                if (audioCtx && audioCtx.state === "suspended") {
+                    audioCtx.resume();
+                    // Reset audio scheduling to prevent stale queue
+                    nextPlayTime = audioCtx.currentTime + 0.05;
+                }
+                // Tell server to resume
+                ws.send(JSON.stringify({ type: "resume" }));
+            }
+        }
+
+        // Pause button click
+        pauseBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            togglePause();
+        });
+
+        // Spacebar to toggle pause
+        document.addEventListener("keydown", (e) => {
+            if (e.code === "Space" && !playOverlay.classList.contains("hidden")) {
+                // Already playing, toggle pause
+            } else if (e.code === "Space") {
+                e.preventDefault();
+                togglePause();
+            }
+        });
+
         // Wait for user click before starting (ensures audio works)
         playOverlay.addEventListener("click", () => {
             // Create audio context immediately on user gesture
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             nextPlayTime = audioCtx.currentTime + 0.05; // Initial buffer
             
-            // Hide overlay
+            // Hide overlay and show pause button
             playOverlay.classList.add("hidden");
+            pauseBtn.classList.add("visible");
             statusEl.textContent = "Connecting...";
             
             // Now connect
