@@ -75,13 +75,33 @@ echo "Output:      $OUTPUT"
 echo "Bitrate:     $BITRATE"
 echo ""
 
+# Check if source is HDR (10-bit or has HDR color transfer)
+PIX_FMT=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$INPUT" 2>/dev/null)
+COLOR_TRC=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=p=0 "$INPUT" 2>/dev/null)
+
+# Determine video filter based on source format
+if [[ "$PIX_FMT" == *"10"* ]] || [[ "$COLOR_TRC" == "smpte2084" ]] || [[ "$COLOR_TRC" == "arib-std-b67" ]]; then
+    echo "Detected HDR/10-bit content, applying tone mapping..."
+    # Check if zscale is available
+    if ffmpeg -filters 2>&1 | grep -q zscale; then
+        VF="zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+    else
+        echo "Warning: zscale not available. Install ffmpeg with --enable-libzimg for best HDR conversion."
+        VF="format=yuv420p"
+    fi
+else
+    VF="format=yuv420p"
+fi
+
 ffmpeg -i "$INPUT" \
+    -map 0:v:0 \
+    -map 0:a:0? \
     -c:v libx264 \
     -b:v "$BITRATE" \
     -preset medium \
     -profile:v high \
     -level 4.1 \
-    -pix_fmt yuv420p \
+    -vf "$VF" \
     -c:a aac \
     -b:a 192k \
     -ac 2 \
