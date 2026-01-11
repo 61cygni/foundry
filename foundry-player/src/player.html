@@ -139,6 +139,41 @@
         #pause-btn.paused .icon::after {
             display: none;
         }
+        #restart-btn {
+            position: fixed;
+            bottom: 20px;
+            left: calc(50% - 80px);
+            transform: translateX(-50%);
+            width: 44px;
+            height: 44px;
+            background: rgba(255, 255, 255, 0.15);
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.3s, transform 0.2s, background 0.2s;
+            opacity: 0;
+            z-index: 50;
+        }
+        #restart-btn:hover {
+            background: rgba(255, 255, 255, 0.25);
+            transform: translateX(-50%) scale(1.1);
+        }
+        body:hover #restart-btn.visible {
+            opacity: 1;
+        }
+        #restart-btn.visible {
+            opacity: 0.3;
+        }
+        /* Restart icon (circular arrow) */
+        #restart-btn::before {
+            content: "↺";
+            color: white;
+            font-size: 22px;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -153,6 +188,7 @@
         <div id="stats-bw"></div>
         <div id="stats-fps"></div>
     </div>
+    <button id="restart-btn"></button>
     <button id="pause-btn" class="playing"><div class="icon"></div></button>
 
     <script type="module">
@@ -165,6 +201,7 @@
         const statsFps = document.getElementById("stats-fps");
         const playOverlay = document.getElementById("play-overlay");
         const pauseBtn = document.getElementById("pause-btn");
+        const restartBtn = document.getElementById("restart-btn");
 
         let isPaused = false;
 
@@ -319,19 +356,57 @@
             }
         }
 
+        function restart() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            
+            statusEl.textContent = "Restarting...";
+            
+            // Reset audio scheduling
+            if (audioCtx) {
+                nextPlayTime = audioCtx.currentTime + 0.05;
+                // Resume if paused
+                if (audioCtx.state === "suspended") {
+                    audioCtx.resume();
+                }
+            }
+            
+            // Reset pause state
+            if (isPaused) {
+                isPaused = false;
+                pauseBtn.classList.remove("paused");
+                pauseBtn.classList.add("playing");
+            }
+            
+            // Tell server to restart
+            ws.send(JSON.stringify({ type: "restart" }));
+            
+            setTimeout(() => {
+                statusEl.textContent = "Playing";
+            }, 500);
+        }
+
         // Pause button click
         pauseBtn.addEventListener("click", (e) => {
             e.stopPropagation();
             togglePause();
         });
 
-        // Spacebar to toggle pause
+        // Restart button click
+        restartBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            restart();
+        });
+
+        // Keyboard shortcuts
         document.addEventListener("keydown", (e) => {
-            if (e.code === "Space" && !playOverlay.classList.contains("hidden")) {
-                // Already playing, toggle pause
-            } else if (e.code === "Space") {
-                e.preventDefault();
-                togglePause();
+            if (playOverlay.classList.contains("hidden")) {
+                if (e.code === "Space") {
+                    e.preventDefault();
+                    togglePause();
+                } else if (e.code === "KeyR") {
+                    e.preventDefault();
+                    restart();
+                }
             }
         });
 
@@ -341,9 +416,10 @@
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             nextPlayTime = audioCtx.currentTime + 0.05; // Initial buffer
             
-            // Hide overlay and show pause button
+            // Hide overlay and show control buttons
             playOverlay.classList.add("hidden");
             pauseBtn.classList.add("visible");
+            restartBtn.classList.add("visible");
             statusEl.textContent = "Connecting...";
             
             // Now connect

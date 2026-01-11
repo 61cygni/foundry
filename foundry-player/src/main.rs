@@ -79,6 +79,8 @@ struct SharedState {
     frame_tx: broadcast::Sender<BroadcastFrame>,
     /// Global pause state - any client can pause/resume
     pause_tx: Arc<watch::Sender<bool>>,
+    /// Restart signal - increments each time restart is requested
+    restart_tx: Arc<watch::Sender<u64>>,
     /// Video config JSON to send to new clients
     video_config_json: Arc<String>,
     /// Number of connected viewers
@@ -149,6 +151,7 @@ async fn main() -> Result<()> {
         
         let (frame_tx, _) = broadcast::channel(BROADCAST_BUFFER);
         let (pause_tx, pause_rx) = watch::channel(false);
+        let (restart_tx, restart_rx) = watch::channel(0u64);
         
         // Build video config JSON
         let config = demuxer.video_config()?;
@@ -165,6 +168,7 @@ async fn main() -> Result<()> {
         let shared_state = SharedState {
             frame_tx: frame_tx.clone(),
             pause_tx: Arc::new(pause_tx),
+            restart_tx: Arc::new(restart_tx),
             video_config_json: Arc::new(config_json.to_string()),
             viewer_count: Arc::new(AtomicUsize::new(0)),
         };
@@ -181,6 +185,7 @@ async fn main() -> Result<()> {
         tokio::spawn(run_shared_playback(
             frame_tx,
             pause_rx,
+            restart_rx,
             playback_state,
             shared_state.viewer_count.clone(),
         ));
@@ -296,6 +301,7 @@ async fn handle_ws_shared(stream: WebSocket, shared: SharedState) {
     }
 
     let pause_tx = shared.pause_tx.clone();
+    let restart_tx = shared.restart_tx.clone();
     let viewer_count = shared.viewer_count.clone();
     
     // Outbound task: forward broadcast frames to this client
@@ -333,7 +339,7 @@ async fn handle_ws_shared(stream: WebSocket, shared: SharedState) {
         viewer_count.fetch_sub(1, Ordering::SeqCst);
     });
 
-    // Inbound task: handle client messages (pause/resume affects everyone)
+    // Inbound task: handle client messages (pause/resume/restart affects everyone)
     let inbound = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
@@ -347,6 +353,12 @@ async fn handle_ws_shared(stream: WebSocket, shared: SharedState) {
                             Some("resume") => {
                                 println!("Resumed (by viewer)");
                                 let _ = pause_tx.send(false);
+                            }
+                            Some("restart") => {
+                                println!("Restart requested (by viewer)");
+                                // Increment restart counter to signal playback loop
+                                let current = *restart_tx.borrow();
+                                let _ = restart_tx.send(current + 1);
                             }
                             _ => {}
                         }
@@ -435,6 +447,7 @@ async fn handle_ws_individual(stream: WebSocket, state: AppState) {
 async fn run_shared_playback(
     frame_tx: broadcast::Sender<BroadcastFrame>,
     mut pause_rx: watch::Receiver<bool>,
+    mut restart_rx: watch::Receiver<u64>,
     state: AppState,
     viewer_count: Arc<AtomicUsize>,
 ) {
@@ -449,6 +462,9 @@ async fn run_shared_playback(
     let audio_chunk_duration = 0.04; // 40ms
     let audio_chunk_samples = (audio_sample_rate as f64 * audio_channels as f64 * audio_chunk_duration) as usize;
 
+    // Track restart counter to detect new restart requests
+    let mut last_restart_count = *restart_rx.borrow();
+
     loop {
         // Wait for at least one viewer before starting playback
         while viewer_count.load(Ordering::SeqCst) == 0 {
@@ -460,6 +476,7 @@ async fn run_shared_playback(
         let mut pause_offset = Duration::ZERO;
         let mut last_audio_time: f64 = start_time;
         let mut found_keyframe = false;
+        let mut restart_requested = false;
         
         let frames = match state.demuxer.frames() {
             Ok(f) => f,
@@ -470,13 +487,47 @@ async fn run_shared_playback(
         };
 
         for frame in frames {
+            // Check for restart request
+            let current_restart = *restart_rx.borrow();
+            if current_restart != last_restart_count {
+                last_restart_count = current_restart;
+                restart_requested = true;
+                println!("Restarting playback...");
+                break;
+            }
+            
             // Check if paused
             while *pause_rx.borrow() {
                 let pause_start = Instant::now();
-                if pause_rx.changed().await.is_err() {
-                    return;
+                
+                // Also check for restart while paused
+                tokio::select! {
+                    result = pause_rx.changed() => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                    _ = restart_rx.changed() => {
+                        let current = *restart_rx.borrow();
+                        if current != last_restart_count {
+                            last_restart_count = current;
+                            restart_requested = true;
+                            println!("Restarting playback (from pause)...");
+                            // Also unpause
+                            break;
+                        }
+                    }
                 }
+                
                 pause_offset += pause_start.elapsed();
+                
+                if restart_requested {
+                    break;
+                }
+            }
+            
+            if restart_requested {
+                break;
             }
             
             let frame = match frame {
@@ -536,6 +587,11 @@ async fn run_shared_playback(
             // Send video frame
             let MediaFrame::Video { data, .. } = frame.media;
             let _ = frame_tx.send(BroadcastFrame::Video(data));
+        }
+
+        // If restart was requested, loop immediately
+        if restart_requested {
+            continue;
         }
 
         if !state.loop_playback {
