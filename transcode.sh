@@ -3,40 +3,72 @@
 # Transcode video for foundry-player streaming
 # Creates an optimized H.264/AAC MP4 at a specified bitrate
 #
-# Usage: ./transcode.sh input.mp4 [bitrate]
-#   bitrate: Target video bitrate (default: 4M)
-#            Examples: 2M, 4M, 8M, 1500k
+# Usage: ./transcode.sh [options] input.mp4
 #
 
 set -e
 
-if [ -z "$1" ]; then
-    echo "Usage: $0 <input.mp4> [bitrate]"
-    echo ""
-    echo "Examples:"
-    echo "  $0 movie.mkv           # Convert to 4 Mbps (default)"
-    echo "  $0 movie.mp4 2M        # Convert to 2 Mbps"
-    echo "  $0 movie.mp4 8M        # Convert to 8 Mbps (higher quality)"
-    echo ""
-    echo "Recommended bitrates:"
-    echo "  720p:  2-4M"
-    echo "  1080p: 4-8M"
-    echo "  4K:    15-25M"
+# Defaults
+BITRATE="4M"
+OUTPUT=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -b|--bitrate)
+            BITRATE="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: $0 [options] <input>"
+            echo ""
+            echo "Options:"
+            echo "  -b, --bitrate <rate>   Video bitrate (default: 4M)"
+            echo "  -o, --output <file>    Output filename (default: input_BITRATE.mp4)"
+            echo "  -h, --help             Show this help"
+            echo ""
+            echo "Examples:"
+            echo "  $0 movie.mkv                        # Convert to 4 Mbps"
+            echo "  $0 -b 2M movie.mp4                  # Convert to 2 Mbps"
+            echo "  $0 -b 2M -o small.mp4 movie.mp4    # Custom output name"
+            echo ""
+            echo "Recommended bitrates:"
+            echo "  720p:  2-4M"
+            echo "  1080p: 4-8M"
+            echo "  4K:    15-25M"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+        *)
+            INPUT="$1"
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$INPUT" ]; then
+    echo "Error: No input file specified"
+    echo "Run '$0 --help' for usage"
     exit 1
 fi
-
-INPUT="$1"
-BITRATE="${2:-4M}"
 
 if [ ! -f "$INPUT" ]; then
     echo "Error: File not found: $INPUT"
     exit 1
 fi
 
-# Generate output filename
-BASENAME="${INPUT%.*}"
-EXT="${INPUT##*.}"
-OUTPUT="${BASENAME}_${BITRATE}.mp4"
+# Generate output filename if not specified
+if [ -z "$OUTPUT" ]; then
+    BASENAME="${INPUT%.*}"
+    OUTPUT="${BASENAME}_${BITRATE}.mp4"
+fi
 
 echo "Transcoding: $INPUT"
 echo "Output:      $OUTPUT"
