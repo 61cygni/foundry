@@ -17,12 +17,15 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
     fs,
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, watch},
     time::{interval, MissedTickBehavior},
 };
 
@@ -33,6 +36,7 @@ use audio_decoder::DecodedAudio;
 use demuxer::{MediaFrame, Mp4Demuxer};
 
 const OUTBOUND_BUFFER: usize = 256;
+const BROADCAST_BUFFER: usize = 64;
 
 #[derive(Parser)]
 #[command(name = "foundry-player")]
@@ -52,6 +56,10 @@ struct Cli {
     /// Start time in seconds (seek into the video)
     #[arg(long, default_value = "0")]
     start: f64,
+
+    /// Shared mode: single playback synced across all viewers
+    #[arg(long)]
+    shared: bool,
 }
 
 #[derive(Clone)]
@@ -60,6 +68,28 @@ struct AppState {
     audio: Option<Arc<DecodedAudio>>,
     loop_playback: bool,
     start_time: f64,
+    // Shared mode state (None if not in shared mode)
+    shared: Option<SharedState>,
+}
+
+/// State for shared/broadcast mode
+#[derive(Clone)]
+struct SharedState {
+    /// Broadcast channel for frames (video and audio)
+    frame_tx: broadcast::Sender<BroadcastFrame>,
+    /// Global pause state - any client can pause/resume
+    pause_tx: Arc<watch::Sender<bool>>,
+    /// Video config JSON to send to new clients
+    video_config_json: Arc<String>,
+    /// Number of connected viewers
+    viewer_count: Arc<AtomicUsize>,
+}
+
+/// Frame types sent over broadcast channel
+#[derive(Clone)]
+enum BroadcastFrame {
+    Video(Vec<u8>),
+    Audio(Vec<u8>),
 }
 
 #[tokio::main]
@@ -111,11 +141,61 @@ async fn main() -> Result<()> {
         None
     };
 
+    let demuxer = Arc::new(demuxer);
+
+    // Setup shared mode if requested
+    let shared = if cli.shared {
+        println!("Shared mode enabled - all viewers will be synced");
+        
+        let (frame_tx, _) = broadcast::channel(BROADCAST_BUFFER);
+        let (pause_tx, pause_rx) = watch::channel(false);
+        
+        // Build video config JSON
+        let config = demuxer.video_config()?;
+        let config_json = serde_json::json!({
+            "type": "video-config",
+            "config": {
+                "codec": config.codec_string,
+                "description": config.description_b64,
+                "width": config.width,
+                "height": config.height,
+            }
+        });
+        
+        let shared_state = SharedState {
+            frame_tx: frame_tx.clone(),
+            pause_tx: Arc::new(pause_tx),
+            video_config_json: Arc::new(config_json.to_string()),
+            viewer_count: Arc::new(AtomicUsize::new(0)),
+        };
+        
+        // Spawn the shared playback loop
+        let playback_state = AppState {
+            demuxer: demuxer.clone(),
+            audio: audio.clone(),
+            loop_playback: cli.loop_playback,
+            start_time: cli.start,
+            shared: None, // Not needed for playback loop
+        };
+        
+        tokio::spawn(run_shared_playback(
+            frame_tx,
+            pause_rx,
+            playback_state,
+            shared_state.viewer_count.clone(),
+        ));
+        
+        Some(shared_state)
+    } else {
+        None
+    };
+
     let state = AppState {
-        demuxer: Arc::new(demuxer),
+        demuxer,
         audio,
         loop_playback: cli.loop_playback,
         start_time: cli.start,
+        shared,
     };
 
     let app = Router::new()
@@ -131,7 +211,8 @@ async fn main() -> Result<()> {
 
     let addr = format!("0.0.0.0:{}", cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("Open http://localhost:{}/", cli.port);
+    let mode = if cli.shared { " (shared mode)" } else { "" };
+    println!("Open http://localhost:{}/{}", cli.port, mode);
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -174,6 +255,117 @@ async fn get_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl Int
 }
 
 async fn handle_ws(stream: WebSocket, state: AppState) {
+    if let Some(shared) = &state.shared {
+        handle_ws_shared(stream, shared.clone()).await;
+    } else {
+        handle_ws_individual(stream, state).await;
+    }
+}
+
+/// Handle WebSocket in shared/broadcast mode
+async fn handle_ws_shared(stream: WebSocket, shared: SharedState) {
+    let (mut sender, mut receiver) = stream.split();
+    
+    // Track this viewer
+    let count = shared.viewer_count.fetch_add(1, Ordering::SeqCst) + 1;
+    println!("Viewer joined ({} connected)", count);
+    
+    // Subscribe to broadcast
+    let mut frame_rx = shared.frame_tx.subscribe();
+    
+    // Send video config first
+    if sender
+        .send(Message::Text(Utf8Bytes::from(shared.video_config_json.as_str())))
+        .await
+        .is_err()
+    {
+        shared.viewer_count.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    
+    // Send mode ack
+    if sender
+        .send(Message::Text(Utf8Bytes::from(
+            r#"{"type":"mode-ack","mode":"video","codec":"avc"}"#,
+        )))
+        .await
+        .is_err()
+    {
+        shared.viewer_count.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+
+    let pause_tx = shared.pause_tx.clone();
+    let viewer_count = shared.viewer_count.clone();
+    
+    // Outbound task: forward broadcast frames to this client
+    let outbound = tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(10));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        
+        loop {
+            tokio::select! {
+                result = frame_rx.recv() => {
+                    match result {
+                        Ok(frame) => {
+                            let msg = match frame {
+                                BroadcastFrame::Video(data) => Message::Binary(data.into()),
+                                BroadcastFrame::Audio(data) => Message::Binary(data.into()),
+                            };
+                            if sender.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!("Viewer lagged, skipped {} frames", n);
+                            // Continue receiving
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                _ = ticker.tick() => {
+                    if sender.send(Message::Text(Utf8Bytes::from("heartbeat"))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        viewer_count.fetch_sub(1, Ordering::SeqCst);
+    });
+
+    // Inbound task: handle client messages (pause/resume affects everyone)
+    let inbound = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&text) {
+                        match cmd.get("type").and_then(|t| t.as_str()) {
+                            Some("pause") => {
+                                println!("Paused (by viewer)");
+                                let _ = pause_tx.send(true);
+                            }
+                            Some("resume") => {
+                                println!("Resumed (by viewer)");
+                                let _ = pause_tx.send(false);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let _ = tokio::try_join!(outbound, inbound);
+    
+    let remaining = shared.viewer_count.load(Ordering::SeqCst);
+    println!("Viewer left ({} connected)", remaining);
+}
+
+/// Handle WebSocket in individual mode (original behavior)
+async fn handle_ws_individual(stream: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = stream.split();
     let (tx, mut rx) = mpsc::channel::<Message>(OUTBOUND_BUFFER);
     
@@ -239,6 +431,123 @@ async fn handle_ws(stream: WebSocket, state: AppState) {
     println!("Session ended");
 }
 
+/// Shared playback loop - broadcasts to all connected viewers
+async fn run_shared_playback(
+    frame_tx: broadcast::Sender<BroadcastFrame>,
+    mut pause_rx: watch::Receiver<bool>,
+    state: AppState,
+    viewer_count: Arc<AtomicUsize>,
+) {
+    let start_time = state.start_time;
+    println!("Shared playback ready (starting at {:.1}s)", start_time);
+
+    // Audio state
+    let audio_sample_rate = state.audio.as_ref().map(|a| a.sample_rate).unwrap_or(48000);
+    let audio_channels = state.audio.as_ref().map(|a| a.channels).unwrap_or(2);
+    let audio_samples = state.audio.as_ref().map(|a| &a.samples[..]);
+    
+    let audio_chunk_duration = 0.04; // 40ms
+    let audio_chunk_samples = (audio_sample_rate as f64 * audio_channels as f64 * audio_chunk_duration) as usize;
+
+    loop {
+        // Wait for at least one viewer before starting playback
+        while viewer_count.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        
+        println!("Starting shared playback...");
+        let playback_start = Instant::now();
+        let mut pause_offset = Duration::ZERO;
+        let mut last_audio_time: f64 = start_time;
+        let mut found_keyframe = false;
+        
+        let frames = match state.demuxer.frames() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Failed to get frames: {}", e);
+                return;
+            }
+        };
+
+        for frame in frames {
+            // Check if paused
+            while *pause_rx.borrow() {
+                let pause_start = Instant::now();
+                if pause_rx.changed().await.is_err() {
+                    return;
+                }
+                pause_offset += pause_start.elapsed();
+            }
+            
+            let frame = match frame {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Frame error: {}", e);
+                    continue;
+                }
+            };
+            
+            if frame.timestamp_secs < start_time {
+                continue;
+            }
+            
+            let MediaFrame::Video { is_keyframe, .. } = &frame.media;
+            if !found_keyframe {
+                if !is_keyframe {
+                    continue;
+                }
+                found_keyframe = true;
+            }
+
+            let relative_time = frame.timestamp_secs - start_time;
+            let target_time = Duration::from_secs_f64(relative_time);
+            let elapsed = playback_start.elapsed() - pause_offset;
+
+            if target_time > elapsed {
+                tokio::time::sleep(target_time - elapsed).await;
+            }
+
+            // Only send if there are viewers
+            if viewer_count.load(Ordering::SeqCst) == 0 {
+                // No viewers, but continue playback timing
+                last_audio_time = frame.timestamp_secs;
+                continue;
+            }
+
+            // Send audio
+            if let Some(samples) = audio_samples {
+                let audio_start_sample = (last_audio_time * audio_sample_rate as f64 * audio_channels as f64) as usize;
+                let audio_end_sample = (frame.timestamp_secs * audio_sample_rate as f64 * audio_channels as f64) as usize;
+                
+                let mut pos = audio_start_sample;
+                while pos < audio_end_sample && pos < samples.len() {
+                    let chunk_end = (pos + audio_chunk_samples).min(audio_end_sample).min(samples.len());
+                    let chunk = &samples[pos..chunk_end];
+                    
+                    if !chunk.is_empty() {
+                        let audio_msg = build_audio_chunk(chunk, audio_sample_rate);
+                        let _ = frame_tx.send(BroadcastFrame::Audio(audio_msg));
+                    }
+                    pos = chunk_end;
+                }
+                last_audio_time = frame.timestamp_secs;
+            }
+
+            // Send video frame
+            let MediaFrame::Video { data, .. } = frame.media;
+            let _ = frame_tx.send(BroadcastFrame::Video(data));
+        }
+
+        if !state.loop_playback {
+            println!("Shared playback complete");
+            break;
+        }
+
+        println!("Looping shared playback...");
+    }
+}
+
+/// Individual playback loop - one per connection (original behavior)
 async fn run_playback(
     tx: mpsc::Sender<Message>,
     state: AppState,
