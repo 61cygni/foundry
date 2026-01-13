@@ -5,7 +5,7 @@ use base64::Engine;
 use mp4::{Mp4Reader, TrackType};
 use std::{
     fs::File,
-    io::BufReader,
+    io::{BufReader, Read, Seek},
     path::Path,
 };
 
@@ -27,9 +27,16 @@ pub enum MediaFrame {
     Video { data: Vec<u8>, is_keyframe: bool },
 }
 
+/// Source for MP4 data - either local file or HTTP URL
+#[derive(Clone)]
+enum Mp4Source {
+    File(std::path::PathBuf),
+    Http { url: String, size: u64 },
+}
+
 /// MP4 demuxer with H.264 passthrough
 pub struct Mp4Demuxer {
-    path: std::path::PathBuf,
+    source: Mp4Source,
     video_track_id: u32,
     has_audio: bool,
     video_width: u32,
@@ -42,10 +49,30 @@ pub struct Mp4Demuxer {
 }
 
 impl Mp4Demuxer {
+    /// Open an MP4 file from a local path
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         let reader = BufReader::new(file);
+        
+        Self::from_reader(reader, size, Mp4Source::File(path.to_path_buf()))
+    }
+
+    /// Open an MP4 file from an HTTP URL using Range requests
+    pub fn open_url(url: &str) -> Result<Self> {
+        use crate::http_reader::HttpReader;
+        
+        let reader = HttpReader::new(url)?;
+        let size = reader.size;
+        
+        Self::from_reader(reader, size, Mp4Source::Http { 
+            url: url.to_string(), 
+            size,
+        })
+    }
+
+    /// Internal: create demuxer from any Read+Seek source
+    fn from_reader<R: Read + Seek>(reader: R, size: u64, source: Mp4Source) -> Result<Self> {
         let mp4 = Mp4Reader::read_header(reader, size)?;
 
         // Find video track
@@ -78,7 +105,7 @@ impl Mp4Demuxer {
             .any(|t| matches!(t.track_type(), Ok(TrackType::Audio)));
 
         Ok(Self {
-            path: path.to_path_buf(),
+            source,
             video_track_id,
             has_audio,
             video_width,
@@ -134,24 +161,51 @@ impl Mp4Demuxer {
     }
 
     /// Returns an iterator over video frames in the file
-    pub fn frames(&self) -> Result<FrameIterator> {
-        let file = File::open(&self.path)?;
-        let size = file.metadata()?.len();
-        let reader = BufReader::new(file);
-        let mp4 = Mp4Reader::read_header(reader, size)?;
+    pub fn frames(&self) -> Result<Box<dyn Iterator<Item = Result<TimestampedFrame>> + Send>> {
+        match &self.source {
+            Mp4Source::File(path) => {
+                let file = File::open(path)?;
+                let size = file.metadata()?.len();
+                let reader = BufReader::new(file);
+                let mp4 = Mp4Reader::read_header(reader, size)?;
 
-        Ok(FrameIterator {
-            mp4,
-            video_track_id: self.video_track_id,
-            video_sample_idx: 1,
-            frame_rate: self.frame_rate,
-            sps_pps_avcc: self.sps_pps_avcc.clone(),
-        })
+                Ok(Box::new(FrameIterator {
+                    mp4,
+                    video_track_id: self.video_track_id,
+                    video_sample_idx: 1,
+                    frame_rate: self.frame_rate,
+                    sps_pps_avcc: self.sps_pps_avcc.clone(),
+                }))
+            }
+            Mp4Source::Http { url, size } => {
+                use crate::http_reader::HttpReader;
+                
+                let reader = HttpReader::new(url)?;
+                let mp4 = Mp4Reader::read_header(reader, *size)?;
+
+                Ok(Box::new(HttpFrameIterator {
+                    mp4,
+                    video_track_id: self.video_track_id,
+                    video_sample_idx: 1,
+                    frame_rate: self.frame_rate,
+                    sps_pps_avcc: self.sps_pps_avcc.clone(),
+                }))
+            }
+        }
     }
 }
 
 pub struct FrameIterator {
     mp4: Mp4Reader<BufReader<File>>,
+    video_track_id: u32,
+    video_sample_idx: u32,
+    frame_rate: f64,
+    /// SPS/PPS NALs to prepend to keyframes
+    sps_pps_avcc: Vec<u8>,
+}
+
+pub struct HttpFrameIterator {
+    mp4: Mp4Reader<crate::http_reader::HttpReader>,
     video_track_id: u32,
     video_sample_idx: u32,
     frame_rate: f64,
@@ -181,6 +235,46 @@ impl Iterator for FrameIterator {
                 
                 // The sample bytes are already in AVCC format (4-byte length prefix)
                 // For keyframes, prepend SPS/PPS so decoder can recognize them
+                let data = if is_keyframe && !self.sps_pps_avcc.is_empty() {
+                    let mut full_data = self.sps_pps_avcc.clone();
+                    full_data.extend_from_slice(&sample.bytes);
+                    full_data
+                } else {
+                    sample.bytes.to_vec()
+                };
+                
+                Some(Ok(TimestampedFrame {
+                    timestamp_secs,
+                    media: MediaFrame::Video { data, is_keyframe },
+                }))
+            }
+            Ok(None) => {
+                self.video_sample_idx += 1;
+                self.next()
+            }
+            Err(e) => Some(Err(anyhow!("Failed to read video sample: {}", e))),
+        }
+    }
+}
+
+impl Iterator for HttpFrameIterator {
+    type Item = Result<TimestampedFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let video_track = self.mp4.tracks().get(&self.video_track_id)?;
+        let video_count = video_track.sample_count();
+
+        if self.video_sample_idx > video_count {
+            return None;
+        }
+
+        // Read video sample
+        match self.mp4.read_sample(self.video_track_id, self.video_sample_idx) {
+            Ok(Some(sample)) => {
+                let timestamp_secs = (self.video_sample_idx - 1) as f64 / self.frame_rate;
+                let is_keyframe = sample.is_sync;
+                self.video_sample_idx += 1;
+                
                 let data = if is_keyframe && !self.sps_pps_avcc.is_empty() {
                     let mut full_data = self.sps_pps_avcc.clone();
                     full_data.extend_from_slice(&sample.bytes);

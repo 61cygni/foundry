@@ -31,6 +31,7 @@ use tokio::{
 
 mod audio_decoder;
 mod demuxer;
+mod http_reader;
 
 use audio_decoder::DecodedAudio;
 use demuxer::{MediaFrame, Mp4Demuxer};
@@ -42,8 +43,17 @@ const BROADCAST_BUFFER: usize = 64;
 #[command(name = "foundry-player")]
 #[command(about = "Stream MP4 files over WebSocket")]
 struct Cli {
-    /// Path to the MP4 file to stream
-    file: PathBuf,
+    /// Path to the MP4 file to stream (use --url for HTTP streaming)
+    #[arg(required_unless_present = "url")]
+    file: Option<PathBuf>,
+
+    /// HTTP URL to stream video from (requires --audio-url for audio)
+    #[arg(long)]
+    url: Option<String>,
+
+    /// HTTP URL for audio file (required with --url, downloaded on startup)
+    #[arg(long)]
+    audio_url: Option<String>,
 
     /// Port to listen on
     #[arg(long, default_value = "23646")]
@@ -98,49 +108,110 @@ enum BroadcastFrame {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if !cli.file.exists() {
-        return Err(anyhow!("File not found: {:?}", cli.file));
-    }
+    // Determine source: URL or local file
+    let (demuxer, audio) = if let Some(url) = &cli.url {
+        // HTTP URL mode
+        println!("Loading video from URL...");
+        let demuxer = Mp4Demuxer::open_url(url)?;
 
-    println!("Loading {:?}...", cli.file);
-    let demuxer = Mp4Demuxer::open(&cli.file)?;
+        println!(
+            "Video: {}x{} @ {:.2} fps, {} frames",
+            demuxer.video_width(),
+            demuxer.video_height(),
+            demuxer.frame_rate(),
+            demuxer.frame_count()
+        );
 
-    println!(
-        "Video: {}x{} @ {:.2} fps, {} frames",
-        demuxer.video_width(),
-        demuxer.video_height(),
-        demuxer.frame_rate(),
-        demuxer.frame_count()
-    );
+        // For URL mode, we need a separate audio file
+        let audio = if let Some(audio_url) = &cli.audio_url {
+            println!("Downloading audio from URL...");
+            match http_reader::download_file(audio_url) {
+                Ok(audio_data) => {
+                    // Decode the downloaded audio
+                    match audio_decoder::decode_audio_from_bytes(&audio_data) {
+                        Ok(Some(decoded)) => {
+                            let duration_secs = decoded.samples.len() as f64 
+                                / decoded.sample_rate as f64 
+                                / decoded.channels as f64;
+                            println!(
+                                "Audio: {} Hz, {} channels, {:.1}s decoded",
+                                decoded.sample_rate,
+                                decoded.channels,
+                                duration_secs
+                            );
+                            Some(Arc::new(decoded))
+                        }
+                        Ok(None) => {
+                            println!("Audio: no audio data found in file");
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!("Audio decode failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to download audio: {}", e);
+                    None
+                }
+            }
+        } else {
+            println!("Audio: none (use --audio-url to provide audio)");
+            None
+        };
 
-    // Decode audio
-    let audio = if demuxer.has_audio() {
-        println!("Decoding audio...");
-        match audio_decoder::decode_audio(&cli.file) {
-            Ok(Some(decoded)) => {
-                let duration_secs = decoded.samples.len() as f64 
-                    / decoded.sample_rate as f64 
-                    / decoded.channels as f64;
-                println!(
-                    "Audio: {} Hz, {} channels, {:.1}s decoded",
-                    decoded.sample_rate,
-                    decoded.channels,
-                    duration_secs
-                );
-                Some(Arc::new(decoded))
-            }
-            Ok(None) => {
-                println!("Audio: no audio data found");
-                None
-            }
-            Err(e) => {
-                eprintln!("Audio decode failed: {}", e);
-                None
-            }
+        (demuxer, audio)
+    } else if let Some(file) = &cli.file {
+        // Local file mode (original behavior)
+        if !file.exists() {
+            return Err(anyhow!("File not found: {:?}", file));
         }
+
+        println!("Loading {:?}...", file);
+        let demuxer = Mp4Demuxer::open(file)?;
+
+        println!(
+            "Video: {}x{} @ {:.2} fps, {} frames",
+            demuxer.video_width(),
+            demuxer.video_height(),
+            demuxer.frame_rate(),
+            demuxer.frame_count()
+        );
+
+        // Decode audio from local file
+        let audio = if demuxer.has_audio() {
+            println!("Decoding audio...");
+            match audio_decoder::decode_audio(file) {
+                Ok(Some(decoded)) => {
+                    let duration_secs = decoded.samples.len() as f64 
+                        / decoded.sample_rate as f64 
+                        / decoded.channels as f64;
+                    println!(
+                        "Audio: {} Hz, {} channels, {:.1}s decoded",
+                        decoded.sample_rate,
+                        decoded.channels,
+                        duration_secs
+                    );
+                    Some(Arc::new(decoded))
+                }
+                Ok(None) => {
+                    println!("Audio: no audio data found");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("Audio decode failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            println!("Audio: none");
+            None
+        };
+
+        (demuxer, audio)
     } else {
-        println!("Audio: none");
-        None
+        return Err(anyhow!("Either a file path or --url must be provided"));
     };
 
     let demuxer = Arc::new(demuxer);

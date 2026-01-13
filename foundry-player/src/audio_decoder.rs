@@ -43,6 +43,29 @@ pub fn decode_audio(path: &Path) -> Result<Option<DecodedAudio>> {
     }
 }
 
+/// Decode audio from bytes (downloaded audio file)
+/// Writes to temp file and uses ffmpeg for decoding
+pub fn decode_audio_from_bytes(data: &[u8]) -> Result<Option<DecodedAudio>> {
+    use std::io::Write;
+    
+    // Write to temp file
+    let temp_dir = std::env::temp_dir();
+    let temp_path = temp_dir.join(format!("foundry_audio_{}.m4a", std::process::id()));
+    
+    {
+        let mut file = File::create(&temp_path)?;
+        file.write_all(data)?;
+    }
+    
+    // Decode using ffmpeg (most reliable for various formats)
+    let result = decode_audio_ffmpeg(&temp_path);
+    
+    // Clean up temp file
+    let _ = std::fs::remove_file(&temp_path);
+    
+    result
+}
+
 /// Decode audio using symphonia (built-in, supports AAC-LC)
 fn decode_audio_symphonia(path: &Path) -> Result<Option<DecodedAudio>> {
     let file = File::open(path)?;
