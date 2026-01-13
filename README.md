@@ -91,10 +91,75 @@ Stream MP4 video files with synchronized audio.
 ./target/release/foundry-player movie.mp4 --port 8080
 ```
 
+### Shared Mode (Multi-Viewer Sync)
+
+Stream to multiple viewers with synchronized playback:
+
+```bash
+# All viewers see the same frame at the same time
+./target/release/foundry-player movie.mp4 --shared
+
+# With looping for continuous playback
+./target/release/foundry-player movie.mp4 --shared --loop-playback
+```
+
+**Controls in shared mode:**
+- Any viewer can **pause/resume** (affects everyone)
+- Any viewer can **restart** playback (press R or click ↺)
+- Late joiners see the stream at current position
+
+### HTTP Streaming (Cloud Deployment)
+
+Stream videos from cloud storage (S3, Tigris, GCS) without downloading the entire file:
+
+```bash
+# 1. Extract audio locally (required for HTTP mode)
+./extract-audio.sh movie.mp4                # Creates movie.audio.m4a
+
+# 2. Upload both files to your storage bucket
+
+# 3. Stream from URLs
+./target/release/foundry-player \
+    --url "https://bucket.storage.example.com/movie.mp4" \
+    --audio-url "https://bucket.storage.example.com/movie.audio.m4a" \
+    --shared
+```
+
+**How it works:**
+- Video streams via HTTP Range requests (fetches data on-demand)
+- Audio downloads completely on startup (~200MB for a 2hr movie)
+- Supports presigned URLs for private buckets
+
+### Transcoding for Lower Bandwidth
+
+Reduce bitrate for bandwidth-constrained streaming:
+
+```bash
+# Default: 4 Mbps 1080p
+./transcode.sh movie.mkv
+
+# Lower bitrate
+./transcode.sh -b 2M movie.mp4
+
+# Lower resolution + bitrate (best for remote streaming)
+./transcode.sh -r 720 -b 1M movie.mp4
+
+# Very low bandwidth
+./transcode.sh -r 480 -b 500k -a 96k movie.mp4
+```
+
+**Transcode options:**
+| Flag | Description |
+|------|-------------|
+| `-b, --bitrate` | Video bitrate (default: 4M) |
+| `-r, --resolution` | Scale to 1080, 720, 480, or WxH |
+| `-a, --audio-bitrate` | Audio bitrate (default: 192k) |
+| `-o, --output` | Output filename |
+
 ### Supported Formats
 
 - **Video**: H.264 (AVC) - passed through directly
-- **Audio**: AAC - decoded to PCM on server
+- **Audio**: AAC - decoded to PCM on server (ffmpeg fallback for HE-AAC)
 
 ### How it works
 
@@ -129,10 +194,19 @@ On first run, macOS will request **Screen Recording** permission. Grant it in:
 
 | File | Purpose |
 |------|---------|
-| `foundry-player/src/main.rs` | WebSocket server, playback pacing |
+| `foundry-player/src/main.rs` | WebSocket server, playback pacing, shared mode |
 | `foundry-player/src/demuxer.rs` | MP4 parsing, H.264 extraction |
-| `foundry-player/src/audio_decoder.rs` | AAC decoding via symphonia |
+| `foundry-player/src/audio_decoder.rs` | AAC decoding via symphonia + ffmpeg fallback |
+| `foundry-player/src/http_reader.rs` | HTTP Range requests for URL streaming |
 | `foundry-player/src/player.html` | Browser UI with WebCodecs |
+
+### Helper Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `transcode.sh` | Convert videos to lower bitrate/resolution |
+| `extract-audio.sh` | Extract audio track for HTTP streaming |
+| `stream-window.sh` | Interactive window selection and streaming |
 
 ### Frontend Components
 
