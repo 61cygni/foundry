@@ -6,7 +6,11 @@
 use anyhow::{anyhow, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Buffer size for reads (64KB)
@@ -180,10 +184,50 @@ impl Seek for HttpReader {
     }
 }
 
-/// Download a file completely into memory
+/// Get the cache directory for foundry-player downloads
+fn get_cache_dir() -> Result<PathBuf> {
+    let cache_dir = std::env::temp_dir().join("foundry-player-cache");
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir)?;
+    }
+    Ok(cache_dir)
+}
+
+/// Generate a cache filename from a URL
+fn url_to_cache_filename(url: &str) -> String {
+    // Hash the URL for a unique but safe filename
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    // Extract extension from URL if possible (e.g., .m4a, .mp4)
+    let extension = url
+        .split('?')
+        .next() // Remove query params
+        .and_then(|path| path.rsplit('.').next())
+        .filter(|ext| ext.len() <= 5 && ext.chars().all(|c| c.is_alphanumeric()))
+        .unwrap_or("bin");
+
+    format!("{:016x}.{}", hash, extension)
+}
+
+/// Download a file completely into memory, with caching
 pub fn download_file(url: &str) -> Result<Vec<u8>> {
+    // Check cache first
+    let cache_dir = get_cache_dir()?;
+    let cache_filename = url_to_cache_filename(url);
+    let cache_path = cache_dir.join(&cache_filename);
+
+    if cache_path.exists() {
+        println!("Loading from cache: {:?}", cache_path);
+        let bytes = fs::read(&cache_path)?;
+        println!("  Cached: {:.1} MB", bytes.len() as f64 / 1_000_000.0);
+        return Ok(bytes);
+    }
+
+    // Not in cache, download it
     println!("Downloading: {}", url);
-    
+
     let client = Client::builder()
         .timeout(Duration::from_secs(300)) // 5 min timeout for large files
         .build()?;
@@ -206,6 +250,13 @@ pub fn download_file(url: &str) -> Result<Vec<u8>> {
 
     let bytes = response.bytes()?.to_vec();
     println!("  Downloaded: {:.1} MB", bytes.len() as f64 / 1_000_000.0);
+
+    // Save to cache
+    if let Err(e) = fs::write(&cache_path, &bytes) {
+        eprintln!("Warning: Failed to cache audio: {}", e);
+    } else {
+        println!("  Cached to: {:?}", cache_path);
+    }
 
     Ok(bytes)
 }
