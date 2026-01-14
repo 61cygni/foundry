@@ -2,22 +2,35 @@
 
 let decoder = null;
 let configured = false;
+let configuring = false;  // Track if configuration is in progress
 let waitingForKey = true;
 let droppedSinceConfig = 0;
+let lastConfig = null;  // Store config for recovery
+let useSoftwareDecoder = false;  // Set via message from main thread
 
 self.onmessage = async (event) => {
-  // console.log("videoWorker.onmessage <=", event.data);
-
-  const { type, config, chunk } = event.data;
+  const { type, config, chunk, software } = event.data;
   try {
     switch (type) {
+      case "set-software-decoder":
+        useSoftwareDecoder = !!software;
+        postMessage({ type: "log", message: `Software decoder: ${useSoftwareDecoder ? "enabled" : "disabled"}` });
+        break;
       case "config":
         await configure(config);
         break;
       case "chunk":
-        if (!configured) {
-          // postMessage({ type: "log", message: "video not configured yet" });
+        // Skip if not configured or currently configuring
+        if (!configured || configuring) {
           return;
+        }
+        // Check if decoder is in error state and needs recovery
+        if (decoder && decoder.state === "closed") {
+          postMessage({ type: "log", message: "decoder closed, attempting recovery..." });
+          if (lastConfig) {
+            await configure(lastConfig);
+          }
+          // After recovery, try to decode this chunk (might be a keyframe!)
         }
         decodeChunk(chunk);
         break;
@@ -34,38 +47,63 @@ async function configure(config) {
     postMessage({ type: "log", message: "missing video config" });
     return;
   }
-  decoder?.close?.();
+  
+  // Mark as configuring to prevent decode attempts during setup
+  configuring = true;
+  configured = false;
+  
+  // Store config for potential recovery
+  lastConfig = config;
+  
+  // Close existing decoder if any
+  if (decoder && decoder.state !== "closed") {
+    try {
+      decoder.close();
+    } catch (e) {
+      // Ignore close errors
+    }
+  }
 
   decoder = new VideoDecoder({
     output: handleFrame,
-    error: (e) =>
-      postMessage({ type: "log", message: `VideoDecoder error ${e}` }),
+    error: (e) => {
+      postMessage({ type: "log", message: `VideoDecoder error ${e}` });
+      // Reset state to allow recovery on next keyframe
+      waitingForKey = true;
+      droppedSinceConfig = 0;
+    },
   });
-  postMessage({ type: "log", message: "VideoDecoder created" });
 
-  const support = await VideoDecoder.isConfigSupported({
-    codec: config.codec,
-    description: base64ToBuffer(config.description),
-    hardwareAcceleration: "prefer-hardware",
-  });
-  if (!support.supported) {
-    postMessage({
-      type: "log",
-      message: `codec not supported: ${config.codec}`,
+  try {
+    const hwAccel = useSoftwareDecoder ? "prefer-software" : "prefer-hardware";
+    
+    const support = await VideoDecoder.isConfigSupported({
+      codec: config.codec,
+      description: base64ToBuffer(config.description),
+      hardwareAcceleration: hwAccel,
     });
-    return;
-  }
-  postMessage({ type: "log", message: `codec supported: ${config.codec}` });
+    if (!support.supported) {
+      postMessage({
+        type: "log",
+        message: `codec not supported: ${config.codec} (${hwAccel})`,
+      });
+      configuring = false;
+      return;
+    }
 
-  decoder.configure({
-    codec: config.codec,
-    description: base64ToBuffer(config.description),
-    hardwareAcceleration: "prefer-hardware",
-  });
-  configured = true;
-  waitingForKey = true;
-  droppedSinceConfig = 0;
-  postMessage({ type: "log", message: `configured ${config.codec}` });
+    decoder.configure({
+      codec: config.codec,
+      description: base64ToBuffer(config.description),
+      hardwareAcceleration: hwAccel,
+    });
+    
+    configured = true;
+    waitingForKey = true;
+    droppedSinceConfig = 0;
+    postMessage({ type: "log", message: `configured ${config.codec}` });
+  } finally {
+    configuring = false;
+  }
 }
 
 function decodeChunk(buffer) {
@@ -76,46 +114,64 @@ function decodeChunk(buffer) {
     postMessage({ type: "log", message: "empty video chunk" });
     return;
   }
+  
   // Expect AVCC (length-prefixed NALs) from server. Scan NALs to see if this chunk has an IDR.
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let cursor = 0;
   let hasIdr = false;
+  let hasSps = false;
   let firstNalType = null;
+  const nalTypes = [];
+  
   while (cursor + 4 <= view.byteLength) {
     const nalLen = view.getUint32(cursor);
     cursor += 4;
     if (nalLen === 0 || cursor + nalLen > view.byteLength) break;
     const nalType = data[cursor] & 0x1f;
+    nalTypes.push(nalType);
     if (firstNalType === null) firstNalType = nalType;
-    if (nalType === 5) {
-      // IDR
-      hasIdr = true;
-      break;
-    }
+    if (nalType === 7) hasSps = true;  // SPS
+    if (nalType === 5) hasIdr = true;  // IDR
     cursor += nalLen;
   }
+  
+  // A proper keyframe should have SPS+PPS+IDR, but we'll accept just IDR
   const chunkType = hasIdr ? "key" : "delta";
+  
   if (waitingForKey && chunkType !== "key") {
     droppedSinceConfig += 1;
     if (droppedSinceConfig % 10 === 1) {
       postMessage({
         type: "log",
-        message: `dropping delta until first keyframe arrives (first NAL type ${firstNalType ?? "unknown"}, dropped=${droppedSinceConfig})`,
+        message: `dropping delta until first keyframe arrives (NAL types: [${nalTypes.join(',')}], dropped=${droppedSinceConfig})`,
       });
-    }
-    // Ask main thread to request a keyframe from the sender after repeated drops.
-    if (droppedSinceConfig % 30 === 0) {
-      postMessage({ type: "request-keyframe" });
     }
     return;
   }
+  
+  if (chunkType === "key") {
+    postMessage({ type: "log", message: `keyframe received (NAL types: [${nalTypes.join(',')}], size=${data.byteLength})` });
+  }
+  
   waitingForKey = false;
-  const chunk = new EncodedVideoChunk({
-    timestamp: performance.now() * 1000, // microseconds
-    type: chunkType,
-    data,
-  });
-  decoder.decode(chunk);
+  
+  try {
+    // Check queue size before decoding large frames
+    const queueSize = decoder.decodeQueueSize;
+    if (chunkType === "key" && (queueSize > 2 || data.byteLength > 80000)) {
+      postMessage({ type: "log", message: `decoding keyframe: queue=${queueSize}, size=${data.byteLength}` });
+    }
+    
+    const chunk = new EncodedVideoChunk({
+      timestamp: performance.now() * 1000, // microseconds
+      type: chunkType,
+      data,
+    });
+    decoder.decode(chunk);
+  } catch (e) {
+    postMessage({ type: "log", message: `decode() threw: ${e}` });
+    waitingForKey = true;
+  }
 }
 
 async function handleFrame(frame) {

@@ -13,8 +13,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Buffer size for reads (64KB)
-const BUFFER_SIZE: usize = 64 * 1024;
+/// Buffer size for reads (2MB - larger to reduce HTTP requests for big moov atoms)
+const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 /// HTTP reader that supports seeking via Range requests
 pub struct HttpReader {
@@ -23,7 +23,7 @@ pub struct HttpReader {
     position: u64,
     /// File size in bytes
     pub size: u64,
-    // Small read buffer to reduce HTTP requests
+    /// Read buffer to reduce HTTP requests
     buffer: Vec<u8>,
     buffer_start: u64,
 }
@@ -32,11 +32,50 @@ impl HttpReader {
     /// Create a new HTTP reader for the given URL
     pub fn new(url: &str) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(30))
+            .user_agent("foundry-player/0.1 (Rust/reqwest)")
+            .tcp_keepalive(Duration::from_secs(30))
             .build()?;
 
         // HEAD request to get file size and check Range support
-        let response = client.head(url).send()?;
+        let response = match client.head(url).send() {
+            Ok(r) => r,
+            Err(_) => {
+                // HEAD might not be supported, try GET with Range: bytes=0-0
+                let fallback = client
+                    .get(url)
+                    .header(RANGE, "bytes=0-0")
+                    .send()
+                    .map_err(|e| anyhow!("HTTP request failed: {}", e))?;
+                
+                if !fallback.status().is_success() && fallback.status().as_u16() != 206 {
+                    return Err(anyhow!("HTTP GET failed: {} {}", fallback.status(), url));
+                }
+                
+                // Get size from Content-Range header (format: bytes 0-0/total)
+                let content_range = fallback
+                    .headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.rsplit('/').next())
+                    .and_then(|v| v.parse::<u64>().ok());
+                
+                if let Some(size) = content_range {
+                    println!("HTTP source: {} ({:.1} MB)", url, size as f64 / 1_000_000.0);
+                    return Ok(Self {
+                        client,
+                        url: url.to_string(),
+                        position: 0,
+                        size,
+                        buffer: Vec::new(),
+                        buffer_start: 0,
+                    });
+                }
+                
+                return Err(anyhow!("Could not determine file size from {}", url));
+            }
+        };
 
         if !response.status().is_success() {
             return Err(anyhow!(
@@ -84,33 +123,42 @@ impl HttpReader {
         let end = (start + len as u64 - 1).min(self.size - 1);
         let range = format!("bytes={}-{}", start, end);
 
-        let response = self
-            .client
-            .get(&self.url)
-            .header(RANGE, &range)
-            .send()?;
-
-        if response.status() == 206 {
-            // Partial content - expected
-            Ok(response.bytes()?.to_vec())
-        } else if response.status().is_success() {
-            // Some servers return 200 with full content
-            // Take just what we need
-            let bytes = response.bytes()?;
-            let actual_start = start as usize;
-            let actual_end = (end as usize + 1).min(bytes.len());
-            if actual_start < bytes.len() {
-                Ok(bytes[actual_start..actual_end].to_vec())
-            } else {
-                Ok(Vec::new())
+        // Retry logic for transient failures
+        let mut last_error = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(100 * attempt as u64));
             }
-        } else {
-            Err(anyhow!(
-                "HTTP Range request failed: {} for range {}",
-                response.status(),
-                range
-            ))
+            
+            match self.client.get(&self.url).header(RANGE, &range).send() {
+                Ok(response) => {
+                    if response.status() == 206 {
+                        // Partial content - expected
+                        return Ok(response.bytes()?.to_vec());
+                    } else if response.status().is_success() {
+                        // Some servers return 200 with full content
+                        let bytes = response.bytes()?;
+                        let actual_start = start as usize;
+                        let actual_end = (end as usize + 1).min(bytes.len());
+                        if actual_start < bytes.len() {
+                            return Ok(bytes[actual_start..actual_end].to_vec());
+                        }
+                        return Ok(Vec::new());
+                    } else {
+                        last_error = Some(anyhow!(
+                            "HTTP Range request returned {}: {}",
+                            response.status(),
+                            range
+                        ));
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(anyhow!("Range request failed for {}: {}", range, e));
+                }
+            }
         }
+        
+        Err(last_error.unwrap_or_else(|| anyhow!("Range request failed for {}", range)))
     }
 
     /// Ensure buffer contains data at current position
@@ -230,6 +278,8 @@ pub fn download_file(url: &str) -> Result<Vec<u8>> {
 
     let client = Client::builder()
         .timeout(Duration::from_secs(300)) // 5 min timeout for large files
+        .user_agent("foundry-player/0.1")
+        .http1_only() // Force HTTP/1.1 for compatibility
         .build()?;
 
     let response = client.get(url).send()?;

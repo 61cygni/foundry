@@ -30,4 +30,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # HTTP streaming (optional, for --url support)
-reqwest = { version = "0.12", features = ["blocking", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

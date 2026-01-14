@@ -207,6 +207,13 @@
 
         const wsScheme = location.protocol === "https:" ? "wss" : "ws";
         const endpoint = `${wsScheme}://${location.host}/ws`;
+        
+        // Check for software decoder flag in URL (?software=1)
+        const urlParams = new URLSearchParams(window.location.search);
+        const useSoftwareDecoder = urlParams.get('software') === '1';
+        if (useSoftwareDecoder) {
+            console.log("Using software decoder (hardware disabled)");
+        }
 
         const stats = createStatsTracker({
             windowMs: 1000,
@@ -219,6 +226,7 @@
             log: console.log,
             requestKeyframe: () => {},
             onFrame: stats.recordFrameSample,
+            useSoftwareDecoder,
         });
 
         // Stereo audio player with sequential scheduling + drift correction
@@ -426,13 +434,7 @@
             connect();
         });
 
-        // Resize canvas to window
-        function resize() {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-        }
-        window.addEventListener("resize", resize);
-        resize();
+        // Note: video.js handles canvas resize with proper DPR support
     </script>
 </body>
 </html>

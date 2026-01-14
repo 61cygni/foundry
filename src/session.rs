@@ -64,8 +64,8 @@ impl Downsampler {
             let even_w = src_w & !1;
             let even_h = src_h & !1;
             if even_w == src_w && even_h == src_h {
-                return DownsampledFrame { frame, scale: 1 };
-            }
+            return DownsampledFrame { frame, scale: 1 };
+        }
             // Need to crop to even dimensions
             let needed = even_w * even_h * 4;
             if self.buffer.len() < needed {

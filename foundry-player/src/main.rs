@@ -37,7 +37,7 @@ use audio_decoder::DecodedAudio;
 use demuxer::{MediaFrame, Mp4Demuxer};
 
 const OUTBOUND_BUFFER: usize = 256;
-const BROADCAST_BUFFER: usize = 64;
+const BROADCAST_BUFFER: usize = 512;  // ~20 seconds at 24fps - prevents keyframe drops
 
 #[derive(Parser)]
 #[command(name = "foundry-player")]
@@ -656,7 +656,10 @@ async fn run_shared_playback(
             }
 
             // Send video frame
-            let MediaFrame::Video { data, .. } = frame.media;
+            let MediaFrame::Video { data, is_keyframe } = frame.media;
+            if is_keyframe {
+                println!("[SERVER] Sending keyframe, size={}", data.len());
+            }
             let _ = frame_tx.send(BroadcastFrame::Video(data));
         }
 

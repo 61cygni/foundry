@@ -50,10 +50,10 @@ impl Recorder {
             CaptureSource::Window(window_id) => {
                 create_window_recorder_thread(
                     window_id,
-                    listeners_clone,
-                    video_startstop_clone,
-                    receive_startstop,
-                )
+                listeners_clone,
+                video_startstop_clone,
+                receive_startstop,
+            )
             }
         });
 

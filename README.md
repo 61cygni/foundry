@@ -156,6 +156,21 @@ Reduce bitrate for bandwidth-constrained streaming:
 | `-a, --audio-bitrate` | Audio bitrate (default: 192k) |
 | `-o, --output` | Output filename |
 
+### Browser Options
+
+Add URL parameters to customize playback:
+
+| Parameter | Description |
+|-----------|-------------|
+| `?software=1` | Use software video decoder (fixes playback glitches on some hardware) |
+
+Example: `http://localhost:23646/?software=1`
+
+**When to use software decoding:**
+- Video freezes periodically with "VideoDecoder error" in console
+- Hardware decoder issues on certain GPUs
+- Slightly higher CPU usage but more reliable playback
+
 ### Supported Formats
 
 - **Video**: H.264 (AVC) - passed through directly

@@ -7,6 +7,7 @@ export function createVideoController({
   onFrameBitmap,
   onFrameSizeChanged,
   autoCloseBitmap = true,
+  useSoftwareDecoder = false,
 } = {}) {
   const target = renderTarget ?? (canvas ? "canvas" : "bitmap");
 
@@ -44,6 +45,12 @@ export function createVideoController({
   }
 
   const videoWorker = new Worker("/video_worker.js", { type: "module" });
+  
+  // Send software decoder preference
+  if (useSoftwareDecoder) {
+    videoWorker.postMessage({ type: "set-software-decoder", software: true });
+  }
+  
   videoWorker.onmessage = (event) => {
     const { type, bitmap, width: fw, height: fh, error, message } = event.data;
     if (error) {
